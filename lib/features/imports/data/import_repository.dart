@@ -388,6 +388,8 @@ class DriftBulkImportRepository implements BulkImportRepository {
               description: null,
               createdAt: now,
               updatedAt: now,
+              rev: 1,
+              dirty: true,
             );
             categoryId = id;
           }
@@ -415,6 +417,8 @@ class DriftBulkImportRepository implements BulkImportRepository {
               description: null,
               createdAt: now,
               updatedAt: now,
+              rev: 1,
+              dirty: true,
             );
             brandId = id;
           }
@@ -462,6 +466,8 @@ class DriftBulkImportRepository implements BulkImportRepository {
             isActive: true,
             createdAt: now,
             updatedAt: now,
+            rev: 1,
+            dirty: true,
           );
           bySku[resolvedSku.toLowerCase()] = rowSnapshot;
           if (resolvedBarcode != null && resolvedBarcode.isNotEmpty) {
@@ -490,6 +496,8 @@ class DriftBulkImportRepository implements BulkImportRepository {
             isActive: product.isActive,
             createdAt: product.createdAt,
             updatedAt: now,
+            rev: 1,
+            dirty: true,
           );
           bySku[resolvedSku.toLowerCase()] = rowSnapshot;
           if (resolvedBarcode != null && resolvedBarcode.isNotEmpty) {
@@ -606,6 +614,8 @@ class DriftBulkImportRepository implements BulkImportRepository {
       createdBy: userId,
       status: 'COMPLETED',
       createdAt: DateTime.now(),
+      rev: 1,
+      dirty: true,
     );
     await _db
         .into(_db.importBatches)

@@ -92,6 +92,7 @@ class _FakeRepo implements BulkImportRepository {
         createdBy: userId,
         status: 'COMPLETED',
         createdAt: DateTime(2026, 3, 1),
+        rev: 1, dirty: false,
       ),
       productsCreated: 1,
       productsUpdated: 1,
@@ -119,6 +120,7 @@ class _FakeRepo implements BulkImportRepository {
         createdBy: 'u1',
         status: 'COMPLETED',
         createdAt: DateTime(2026, 1, 15),
+        rev: 1, dirty: false,
       ),
     ];
   }

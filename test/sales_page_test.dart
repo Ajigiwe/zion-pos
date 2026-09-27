@@ -29,6 +29,7 @@ Product sampleProduct({double price = 5800, double stock = 5}) => Product(
   isActive: true,
   createdAt: DateTime(2026, 1, 1),
   updatedAt: DateTime(2026, 1, 1),
+  rev: 1, dirty: false,
 );
 
 class FakeSaleRepository implements SaleRepository {
@@ -203,6 +204,7 @@ void main() {
       isSynced: true,
       createdAt: DateTime(2026, 1, 1, 14, 5),
       updatedAt: DateTime(2026, 1, 1, 14, 5),
+      rev: 1, dirty: false,
     );
     final item = SaleItem(
       id: 'i1',
@@ -214,6 +216,7 @@ void main() {
       tax: 0,
       subtotal: 5800,
       serialNumberId: null,
+      rev: 1, dirty: false,
     );
     final detail = SaleDetail(
       sale: sale,
@@ -226,6 +229,7 @@ void main() {
           amount: 5800,
           reference: null,
           createdAt: DateTime(2026, 1, 1, 14, 5),
+          rev: 1, dirty: false,
         ),
       ],
     );

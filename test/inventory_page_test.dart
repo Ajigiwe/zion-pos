@@ -32,6 +32,7 @@ Product sampleProduct() => Product(
   isActive: true,
   createdAt: DateTime(2026, 1, 1),
   updatedAt: DateTime(2026, 1, 1),
+  rev: 1, dirty: false,
 );
 
 void useDesktopViewport(WidgetTester tester) {
@@ -70,6 +71,7 @@ void main() {
                   quantity: 10,
                   reason: 'Opening stock',
                   createdAt: DateTime(2026, 1, 1, 9, 30),
+                  rev: 1, dirty: false,
                 ),
                 product: product,
               ),

@@ -108,6 +108,8 @@ class DriftAuthRepository implements AuthRepository {
           role: userData['role'] as String,
           isActive: userData['isActive'] as bool,
           createdAt: DateTime.parse(userData['createdAt'] as String),
+          rev: userData['rev'] as int? ?? 1,
+          dirty: false,
         );
 
         final existingUser = await (_db.select(_db.users)
@@ -128,6 +130,8 @@ class DriftAuthRepository implements AuthRepository {
               role: Value(cachedUser.role),
               isActive: Value(cachedUser.isActive),
               createdAt: Value(cachedUser.createdAt),
+              rev: Value(cachedUser.rev),
+              dirty: const Value(false),
             ),
           );
         } else {
@@ -140,6 +144,8 @@ class DriftAuthRepository implements AuthRepository {
               role: cachedUser.role,
               isActive: Value(cachedUser.isActive),
               createdAt: Value(cachedUser.createdAt),
+              rev: Value(cachedUser.rev),
+              dirty: const Value(false),
             ),
           );
         }
@@ -204,6 +210,8 @@ class DriftAuthRepository implements AuthRepository {
       role: role.toUpperCase(),
       isActive: true,
       createdAt: DateTime.now(),
+      rev: 1,
+      dirty: true,
     );
     await _db
         .into(_db.users)

@@ -13,4 +13,5 @@ User testUser({
   role: role,
   isActive: true,
   createdAt: DateTime(2026, 1, 1),
+  rev: 1, dirty: false,
 );

@@ -21,6 +21,7 @@ Product _makeProduct(String id, String name, String sku, double price) {
     isActive: true,
     createdAt: now,
     updatedAt: now,
+    rev: 1, dirty: false,
   );
 }
 

@@ -74,6 +74,7 @@ void main() {
       isActive: true,
       createdAt: DateTime(2026, 1, 1),
       updatedAt: DateTime(2026, 1, 1),
+      rev: 1, dirty: false,
     );
     final printer = _CapturingPrintService();
     await tester.pumpWidget(

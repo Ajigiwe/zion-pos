@@ -22,6 +22,7 @@ Sale sampleSale() => Sale(
   isSynced: true,
   createdAt: DateTime(2026, 1, 1, 10, 0),
   updatedAt: DateTime(2026, 1, 1, 10, 0),
+  rev: 1, dirty: false,
 );
 
 void main() {

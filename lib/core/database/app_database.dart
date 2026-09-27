@@ -1,6 +1,8 @@
 import 'package:drift/drift.dart';
 import 'package:drift_flutter/drift_flutter.dart';
+import 'package:instrument_pos/core/database/sync_schema.dart';
 import 'package:instrument_pos/core/database/tables.dart';
+import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/core/security/passwords.dart';
 import 'package:instrument_pos/core/store_info.dart';
 import 'package:uuid/uuid.dart';
@@ -24,6 +26,7 @@ part 'app_database.g.dart';
     AuditLogs,
     ImportBatches,
     Settings,
+    SyncQueue,
   ],
 )
 class AppDatabase extends _$AppDatabase {
@@ -51,7 +54,7 @@ class AppDatabase extends _$AppDatabase {
   /// Bump whenever the schema changes; backups preflight against this so a
   /// database exported by a newer app version is never restored over an
   /// older one.
-  static const int currentSchemaVersion = 7;
+  static const int currentSchemaVersion = 8;
 
   @override
   int get schemaVersion => currentSchemaVersion;
@@ -59,6 +62,8 @@ class AppDatabase extends _$AppDatabase {
   MigrationStrategy get migration => MigrationStrategy(
     onCreate: (m) async {
       await m.createAll();
+      await createSyncMetaTables(m.database);
+      await createSyncTriggers(m.database);
       await _seed();
     },
     onUpgrade: (m, from, to) async {
@@ -90,11 +95,73 @@ class AppDatabase extends _$AppDatabase {
         // Offline-first sync tracking
         await m.addColumn(sales, sales.isSynced);
       }
+      if (from < 8) {
+        // LAN sync: change sequence + dirty flag on every table, plus the
+        // outbox queue and the raw helper tables the sync triggers read.
+        await m.addColumn(users, users.rev);
+        await m.addColumn(users, users.dirty);
+        await m.addColumn(categories, categories.rev);
+        await m.addColumn(categories, categories.dirty);
+        await m.addColumn(brands, brands.rev);
+        await m.addColumn(brands, brands.dirty);
+        await m.addColumn(suppliers, suppliers.rev);
+        await m.addColumn(suppliers, suppliers.dirty);
+        await m.addColumn(products, products.rev);
+        await m.addColumn(products, products.dirty);
+        await m.addColumn(settings, settings.rev);
+        await m.addColumn(settings, settings.dirty);
+        await m.addColumn(sales, sales.rev);
+        await m.addColumn(sales, sales.dirty);
+        await m.addColumn(saleItems, saleItems.rev);
+        await m.addColumn(saleItems, saleItems.dirty);
+        await m.addColumn(payments, payments.rev);
+        await m.addColumn(payments, payments.dirty);
+        await m.addColumn(refunds, refunds.rev);
+        await m.addColumn(refunds, refunds.dirty);
+        await m.addColumn(refundItems, refundItems.rev);
+        await m.addColumn(refundItems, refundItems.dirty);
+        await m.addColumn(exchanges, exchanges.rev);
+        await m.addColumn(exchanges, exchanges.dirty);
+        await m.addColumn(stockMovements, stockMovements.rev);
+        await m.addColumn(stockMovements, stockMovements.dirty);
+        await m.addColumn(auditLogs, auditLogs.rev);
+        await m.addColumn(auditLogs, auditLogs.dirty);
+        await m.addColumn(importBatches, importBatches.rev);
+        await m.addColumn(importBatches, importBatches.dirty);
+        await m.createTable(syncQueue);
+        await createSyncMetaTables(m.database);
+        await createSyncTriggers(m.database);
+        await _repairDuplicatedSaleMovements(m.database);
+      }
       // Older databases predate the owner seed / settings rows.
       await _ensureDefaultOwner();
       await _ensureStoreSettings();
     },
+    beforeOpen: (details) async {
+      // The sync triggers update the rows they fire on; SQLite only re-runs
+      // triggers recursively when this pragma is on.
+      await customStatement('PRAGMA recursive_triggers = OFF');
+      await setSyncRole(this, WorkstationConfig.current.mode);
+    },
   );
+
+  /// Re-records the station role after the user switches modes at runtime.
+  Future<void> updateSyncRole(String mode) => setSyncRole(this, mode);
+
+  /// Repairs stock duplicated by the pre-v8 LAN protocol, which wrote a host
+  /// `sync-…` movement next to the client's own movement for the same sale
+  /// line. Keeps one copy so `SUM(quantity)` matches reality again.
+  Future<void> _repairDuplicatedSaleMovements(DatabaseConnectionUser db) async {
+    await db.customStatement(
+      "DELETE FROM stock_movements "
+      "WHERE id LIKE 'sync-%' AND referenceType = 'sale' AND EXISTS ("
+      '  SELECT 1 FROM stock_movements other'
+      '  WHERE other.referenceId = stock_movements.referenceId'
+      '    AND other.productId = stock_movements.productId'
+      '    AND other.id <> stock_movements.id'
+      ')',
+    );
+  }
 
   Future<void> _seed() async {
     final now = DateTime.now();

@@ -23,6 +23,7 @@ Product makeProduct(String id, String name, {double price = 320}) => Product(
   isActive: true,
   createdAt: DateTime(2026, 1, 1),
   updatedAt: DateTime(2026, 1, 1),
+  rev: 1, dirty: false,
 );
 
 void main() {

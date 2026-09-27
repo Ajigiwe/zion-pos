@@ -29,6 +29,7 @@ class _FakeProductsRepository implements ProductsRepository {
         isActive: true,
         createdAt: DateTime(2026, 1, 1),
         updatedAt: DateTime(2026, 1, 1),
+        rev: 1, dirty: false,
       ),
       stock: 5.0,
     ),

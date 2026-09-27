@@ -1,5 +1,20 @@
 import 'package:drift/drift.dart';
 
+/// Sync metadata carried by every table (design doc §24).
+///
+/// `rev` is the host-assigned change sequence. It doubles as the delta-sync
+/// cursor (`rev > lastSeen`) and as optimistic-concurrency control: a client
+/// edits a row it last saw at `rev = N`, and the host only accepts that change
+/// while the row is still at `N`.
+///
+/// `dirty` marks rows with local changes not yet accepted by the host station.
+/// It is set by database triggers (see `sync_schema.dart`), never by hand.
+// Every table declares these two columns explicitly: the drift generator only
+// picks up columns declared on the table class itself.
+//
+//   IntColumn get rev => integer().withDefault(const Constant(1))();
+//   BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+
 /// Users of the POS, mirroring the design doc's `users` entity.
 /// `role` is one of OWNER, ADMIN, MANAGER, CASHIER, INVENTORY_MANAGER.
 class Users extends Table {
@@ -10,6 +25,8 @@ class Users extends Table {
   TextColumn get role => text()();
   BoolColumn get isActive => boolean().withDefault(const Constant(true))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 class Categories extends Table {
@@ -18,6 +35,8 @@ class Categories extends Table {
   TextColumn get description => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 class Brands extends Table {
@@ -26,6 +45,8 @@ class Brands extends Table {
   TextColumn get description => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 class Suppliers extends Table {
@@ -36,6 +57,8 @@ class Suppliers extends Table {
   TextColumn get address => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// Whether a product is counted by quantity only, or tracked by serial number.
@@ -63,6 +86,8 @@ class Products extends Table {
   BoolColumn get isActive => boolean().withDefault(const Constant(true))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// How a customer paid, per design doc §12. A sale may have several payment
@@ -94,6 +119,8 @@ class Sales extends Table {
   BoolColumn get isSynced => boolean().withDefault(const Constant(true))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// A single product line on a sale (§11). unitPrice snapshots the price at
@@ -110,9 +137,11 @@ class SaleItems extends Table {
 
   /// Populated for serialized products once serial tracking is implemented.
   TextColumn get serialNumberId => text().nullable()();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
-/// One payment record for a sale (§12). A cash + mobile money split is two
+/// One payment record on a sale (§12). A cash + mobile money split is two
 /// rows with the same saleId.
 class Payments extends Table {
   TextColumn get id => text()();
@@ -121,6 +150,8 @@ class Payments extends Table {
   RealColumn get amount => real()();
   TextColumn get reference => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// Money returned to a customer against an original sale (§14). The original
@@ -134,6 +165,8 @@ class Refunds extends Table {
   RealColumn get amount => real()();
   TextColumn get reason => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// Which original sale lines were returned and how much of each (§14).
@@ -145,6 +178,8 @@ class RefundItems extends Table {
   RealColumn get quantity => real()();
   RealColumn get unitPrice => real()();
   RealColumn get subtotal => real()();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// An exchange links the return of goods from an original sale to a
@@ -163,6 +198,8 @@ class Exchanges extends Table {
   /// difference, negative means cash was returned.
   RealColumn get difference => real()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// Generic local key/value settings. The store profile (printed on receipts)
@@ -173,6 +210,8 @@ class Settings extends Table {
   TextColumn get key => text()();
   TextColumn get value => text()();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 
   @override
   Set<Column> get primaryKey => {key};
@@ -191,6 +230,8 @@ class AuditLogs extends Table {
   TextColumn get details => text().nullable()();
   TextColumn get deviceId => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 /// All stock movements recorded in the ledger, per design doc §13.
@@ -227,6 +268,8 @@ class ImportBatches extends Table {
   TextColumn get createdBy => text().nullable()();
   TextColumn get status => text().withDefault(const Constant('COMPLETED'))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
 }
 
 class StockMovements extends Table {
@@ -241,4 +284,42 @@ class StockMovements extends Table {
   TextColumn get userId => text().nullable()();
   TextColumn get reason => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  IntColumn get rev => integer().withDefault(const Constant(1))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+}
+
+/// Pending outbound sync operations (design doc §24 `sync_queue`).
+///
+/// Every local write that must reach the host appends one row here; the LAN
+/// sync service flushes them in batches and marks them `synced` (or records
+/// the error and retries with backoff). Rows are idempotent: the operation id
+/// is a UUID the host recognises on retry.
+@DataClassName('SyncQueueEntry')
+class SyncQueue extends Table {
+  /// Operation id (UUID) — the idempotency key the host dedupes on.
+  TextColumn get id => text()();
+
+  /// 'catalog' (conflict-checked upsert) or 'tx' (append-only create).
+  TextColumn get kind => text()();
+
+  /// SQL table name the operation targets, e.g. 'products'.
+  TextColumn get targetTable => text()();
+
+  /// Primary-key value of the affected row.
+  TextColumn get entityId => text()();
+
+  /// Last host revision this row was based on; 0 for brand-new rows.
+  IntColumn get baseRev => integer().withDefault(const Constant(0))();
+
+  /// Full row as JSON, captured at enqueue time.
+  TextColumn get payload => text()();
+
+  IntColumn get retryCount => integer().withDefault(const Constant(0))();
+  TextColumn get status => text().withDefault(const Constant('PENDING'))();
+  TextColumn get lastError => text().nullable()();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get syncedAt => dateTime().nullable()();
+
+  @override
+  Set<Column> get primaryKey => {id};
 }

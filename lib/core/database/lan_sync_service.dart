@@ -7,17 +7,22 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:instrument_pos/core/database/app_database.dart';
 import 'package:instrument_pos/core/database/database_provider.dart';
-import 'package:instrument_pos/core/database/tables.dart';
+import 'package:instrument_pos/core/database/sync_schema.dart';
 import 'package:instrument_pos/core/database/workstation_config.dart';
-import 'package:uuid/uuid.dart';
+import 'package:instrument_pos/core/security/sync_auth.dart';
 
-/// Background synchronization service using pure HTTP REST calls.
+/// Delta sync between a client terminal and the host station.
 ///
-/// Features:
-/// - Heartbeat POST every 10s   → maintains terminal presence on Host
-/// - Catalog GET every 5s       → pulls users, products, stock movements, and sales from Host
-/// - Sales POST on each sale    → pushes client sales immediately to Host
-/// - Changes POST on edit       → pushes locally added/modified products and stock to Host
+/// One cycle = handshake, outbox flush, pull:
+///  * `/api/hello` checks the host schema and cursor;
+///  * `/api/outbox` ships every row this station still marks `dirty`,
+///    parent tables first, and stamps the host's revision on acceptance;
+///  * `/api/changes` applies host rows this station has not seen yet —
+///    rows with local pending edits are left alone so the push wins the
+///    conflict check instead of being silently overwritten.
+///
+/// The host may be a laptop that leaves and returns: nothing here assumes a
+/// connection survives between cycles, and every request is safe to retry.
 class LanSyncService {
   LanSyncService(this._localDb) {
     instance = this;
@@ -27,687 +32,571 @@ class LanSyncService {
 
   /// Globally trigger immediate sync from anywhere in the app (e.g. checkout).
   static void triggerSync() {
-    instance?.syncNow();
+    unawaited(instance?.syncNow());
   }
 
   final AppDatabase _localDb;
-  final String _stationId = const Uuid().v4();
+
+  late final Map<String, TableInfo<Table, DataClass>> _infos =
+      syncTableInfos(_localDb);
 
   Timer? _heartbeatTimer;
-  Timer? _catalogTimer;
+  Timer? _cycleTimer;
   bool _isStarted = false;
   bool _isSyncing = false;
+  Duration _interval = const Duration(seconds: 5);
 
   final ValueNotifier<bool> isOnlineNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<int> pendingSyncCountNotifier = ValueNotifier<int>(0);
 
-  static const _catalogInterval = Duration(seconds: 5);
+  /// Last handshake/push/pull failure, for the sync status UI.
+  final ValueNotifier<String> statusNotifier = ValueNotifier<String>('Idle');
+
   static const _heartbeatInterval = Duration(seconds: 10);
-  static const _httpTimeout = Duration(seconds: 6);
+  static const _httpTimeout = Duration(seconds: 8);
+  static const _minInterval = Duration(seconds: 5);
+  static const _maxInterval = Duration(seconds: 60);
+  static const _pageSize = 500;
+  static const _opsPerBatch = 200;
+  static const _rowsPerTablePerCycle = 100;
+
+  WorkstationConfig get _config => WorkstationConfig.current;
+
+  bool get _canSync {
+    final config = _config;
+    return config.isClient && config.hostAddress.isNotEmpty;
+  }
 
   void start() {
     if (_isStarted) return;
     _isStarted = true;
-
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) {
+    if (!_canSync) {
       isOnlineNotifier.value = true;
       return;
     }
-
-    // Run immediately on start, then on fast intervals
-    _sendHeartbeat();
-    _pushOfflineSales();
-    _syncCatalog();
-
-    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) => _sendHeartbeat());
-    _catalogTimer = Timer.periodic(_catalogInterval, (_) async {
-      await _pushOfflineSales();
-      await _pushClientChanges();
-      await _syncCatalog();
-    });
+    _heartbeatTimer = Timer.periodic(
+      _heartbeatInterval,
+      (_) => unawaited(_sendHeartbeat()),
+    );
+    unawaited(_sendHeartbeat());
+    _scheduleCycle();
+    unawaited(syncNow());
   }
 
   void stop() {
     if (!_isStarted) return;
     _isStarted = false;
     _heartbeatTimer?.cancel();
-    _catalogTimer?.cancel();
+    _cycleTimer?.cancel();
     _heartbeatTimer = null;
-    _catalogTimer = null;
-    _unregister(); // best-effort graceful unregister
+    _cycleTimer = null;
+    _unregister();
     isOnlineNotifier.value = false;
   }
 
-  /// Called after a sale or inventory change is completed to push immediately.
-  Future<void> syncNow() async {
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
-    await _pushOfflineSales();
-    await _pushClientChanges();
-    await _syncCatalog();
+  /// Re-reads the workstation mode: called after the user switches between
+  /// host / client / standalone at runtime.
+  Future<void> restart() async {
+    stop();
+    start();
+    if (_canSync) await syncNow();
   }
 
-  // ── Heartbeat ────────────────────────────────────────────────────────────
+  /// Runs one cycle right now (sale completed, catalog edit, …).
+  Future<void> syncNow() async {
+    if (!_canSync || _isSyncing) return;
+    await _runCycle();
+  }
+
+  // ── Cycle ────────────────────────────────────────────────────────────────
+
+  Future<void> _runCycle() async {
+    if (_isSyncing) return;
+    _isSyncing = true;
+    try {
+      final hello = await _hello();
+      if (hello == null) return;
+
+      if (hello['forceFullSync'] == true) {
+        // The host database was rebuilt under us: start over.
+        await WorkstationConfig.saveLastRev(0);
+      }
+
+      final pushed = await _flushOutbox();
+      final pulled = await _pullChanges();
+      await _refreshPendingCount();
+      if (pushed && pulled) _succeed('Synced');
+    } finally {
+      _isSyncing = false;
+      if (_isStarted) _scheduleCycle();
+    }
+  }
+
+  void _scheduleCycle() {
+    _cycleTimer?.cancel();
+    if (!_isStarted) return;
+    _cycleTimer = Timer(_interval, () {
+      unawaited(_runCycle());
+    });
+  }
+
+  void _succeed(String message) {
+    _interval = _minInterval;
+    isOnlineNotifier.value = true;
+    statusNotifier.value = message;
+  }
+
+  void _fail(String message) {
+    // Back off while the host is away so a laptop that left the shop does
+    // not get hammered; reset on the first success.
+    final doubled = _interval * 2;
+    _interval = doubled > _maxInterval ? _maxInterval : doubled;
+    isOnlineNotifier.value = false;
+    statusNotifier.value = message;
+    debugPrint('[LanSyncService] $message');
+  }
+
+  // ── Handshake ────────────────────────────────────────────────────────────
+
+  Future<Map<String, dynamic>?> _hello() async {
+    final result = await _post('/api/hello', {
+      'stationId': _config.stationId,
+      'schemaVersion': AppDatabase.currentSchemaVersion,
+      'lastRev': _config.lastRev,
+    });
+    final body = result.body;
+    if (result.statusCode != HttpStatus.ok || body == null) {
+      _fail(_describeFailure(result));
+      return null;
+    }
+    if (body['ok'] != true) {
+      _fail(_describeFailure(result));
+      return null;
+    }
+    return body;
+  }
+
+  String _describeFailure(_ApiResult result) {
+    final error = result.body?['error'] as String?;
+    switch (error) {
+      case 'pin_required':
+        return 'Host has no security PIN set — sync is disabled.';
+      case 'unauthorized':
+        return 'Sync PIN rejected by the host.';
+      case 'schema_mismatch':
+        return 'Host runs a different app version — update this terminal.';
+    }
+    if (result.statusCode == 0) {
+      return 'Host unreachable at ${_config.hostAddress}:${_config.hostPort}.';
+    }
+    return 'Host responded with HTTP ${result.statusCode}.';
+  }
+
+  // ── Push ─────────────────────────────────────────────────────────────────
+
+  Future<bool> _flushOutbox() async {
+    final ops = await _collectOps();
+    if (ops.isEmpty) return true;
+
+    for (var start = 0; start < ops.length; start += _opsPerBatch) {
+      final batch = ops.sublist(
+        start,
+        start + _opsPerBatch > ops.length ? ops.length : start + _opsPerBatch,
+      );
+      final result = await _post('/api/outbox', {'ops': batch});
+      if (result.statusCode != HttpStatus.ok || result.body?['ok'] != true) {
+        _fail(_describeFailure(result));
+        return false;
+      }
+      final results = (result.body!['results'] as List<dynamic>? ?? [])
+          .cast<Map<String, dynamic>>();
+      await _applyResults(batch, results);
+    }
+    return true;
+  }
+
+  /// Every row this station still owes the host, parent tables first.
+  Future<List<Map<String, dynamic>>> _collectOps() async {
+    final ops = <Map<String, dynamic>>[];
+    for (final spec in syncTables) {
+      final info = _infos[spec.table];
+      if (info == null || spec.fromJson == null) continue;
+      final rows = await selectSyncRows(
+        _localDb,
+        info,
+        where: 'dirty = 1',
+        limit: _rowsPerTablePerCycle,
+      );
+      for (final row in rows) {
+        final payload = row.toJson();
+        // Machine-local settings (printer.*, theme_*) are never shared.
+        if (spec.table == 'settings' &&
+            !isSharedSettingKey(payload['key'] as String? ?? '')) {
+          continue;
+        }
+        ops.add({
+          'opId': '${spec.table}|${payload[syncPrimaryKey(spec.table)]}',
+          'table': spec.table,
+          'kind': spec.kind.name,
+          'baseRev': payload['rev'],
+          'payload': payload,
+        });
+      }
+    }
+    return ops;
+  }
+
+  Future<void> _applyResults(
+    List<Map<String, dynamic>> ops,
+    List<Map<String, dynamic>> results,
+  ) async {
+    final byId = {for (final r in results) r['opId'] as String: r};
+    for (final op in ops) {
+      final result = byId[op['opId'] as String];
+      if (result == null) continue;
+      final table = op['table'] as String;
+      final entityId = op['payload'][syncPrimaryKey(table)] as String;
+      final status = result['status'] as String? ?? '';
+
+      switch (status) {
+        case 'applied':
+        case 'duplicate':
+          await _ack(table, entityId, result['rev'] as int? ?? 0);
+          await _clearFailure(table, entityId);
+        case 'ignored':
+          await _ack(table, entityId, result['rev'] as int? ?? 0);
+        case 'conflict':
+          await _resolveConflict(op, result);
+        default:
+          await _recordFailure(
+            op,
+            result['message'] as String? ?? 'Rejected by host',
+          );
+      }
+    }
+  }
+
+  /// Host accepted the row: store its revision and stop pushing it.
+  Future<void> _ack(String table, String entityId, int rev) async {
+    final pk = syncPrimaryKey(table);
+    final extra = table == 'sales' ? ', is_synced = 1' : '';
+    await _localDb.customUpdate(
+      'UPDATE "$table" SET rev = ?, dirty = 0$extra WHERE "$pk" = ?',
+      variables: [Variable.withInt(rev), Variable.withString(entityId)],
+      updates: {_infos[table]!},
+    );
+  }
+
+  Future<void> _resolveConflict(
+    Map<String, dynamic> op,
+    Map<String, dynamic> result,
+  ) async {
+    final table = op['table'] as String;
+    final entityId = op['payload'][syncPrimaryKey(table)] as String;
+    final code = result['code'] as String? ?? '';
+
+    if (code == 'stale') {
+      // Host row moved on while we edited: the host is the source of truth.
+      await writeSyncRow(
+        _localDb,
+        table: table,
+        info: _infos[table]!,
+        row: syncSpecFor(table)!.fromJson!(
+          result['row'] as Map<String, dynamic>,
+        )!,
+        entityId: entityId,
+        rev: result['rev'] as int? ?? 0,
+        dirty: false,
+        replaceOnConflict: true,
+      );
+      await _clearFailure(table, entityId);
+      debugPrint('[LanSyncService] $table/$entityId resolved: host version kept');
+      return;
+    }
+
+    if (code == 'unique') {
+      final column = result['column'] as String?;
+      final renamed = await _freeUniqueValue(table, entityId, column);
+      if (renamed) {
+        await _clearFailure(table, entityId);
+        return;
+      }
+    }
+    await _recordFailure(op, 'Conflict on $table/$entityId');
+  }
+
+  /// Frees a colliding SKU/name by tagging it with this station's code so
+  /// the row can be pushed on the next cycle instead of looping forever.
+  /// Returns false when the column must not be rewritten (usernames).
+  Future<bool> _freeUniqueValue(
+    String table,
+    String entityId,
+    String? column,
+  ) async {
+    const renameable = {
+      'products': 'sku',
+      'categories': 'name',
+      'brands': 'name',
+      'import_batches': 'batch_number',
+    };
+    final expected = renameable[table];
+    if (column == null || expected != column) return false;
+
+    final code = _config.stationCode;
+    if (code.isEmpty) return false;
+    final pk = syncPrimaryKey(table);
+    final rows = await _localDb.customSelect(
+      'SELECT "$column" AS value FROM "$table" WHERE "$pk" = ?',
+      variables: [Variable.withString(entityId)],
+    ).get();
+    if (rows.isEmpty) return false;
+    final current = rows.first.read<String?>('value') ?? '';
+    final suffix = '-$code';
+    if (current.endsWith(suffix)) return false;
+    await _localDb.customUpdate(
+      'UPDATE "$table" SET "$column" = ? WHERE "$pk" = ?',
+      variables: [
+        Variable.withString('$current$suffix'),
+        Variable.withString(entityId),
+      ],
+      updates: {_infos[table]!},
+    );
+    debugPrint(
+      '[LanSyncService] Renamed $table.$column "$current" -> "$current$suffix"',
+    );
+    return true;
+  }
+
+  Future<void> _recordFailure(Map<String, dynamic> op, String message) async {
+    final table = op['table'] as String;
+    final entityId = op['payload'][syncPrimaryKey(table)] as String;
+    final id = '$table|$entityId';
+    final existing = await (_localDb.select(_localDb.syncQueue)
+          ..where((q) => q.id.equals(id)))
+        .getSingleOrNull();
+    await _localDb.into(_localDb.syncQueue).insertOnConflictUpdate(
+          SyncQueueEntry(
+            id: id,
+            kind: op['kind'] as String? ?? 'tx',
+            targetTable: table,
+            entityId: entityId,
+            baseRev: op['baseRev'] as int? ?? 0,
+            payload: jsonEncode(op['payload']),
+            retryCount: (existing?.retryCount ?? 0) + 1,
+            status: 'PENDING',
+            lastError: message,
+            createdAt: existing?.createdAt ?? DateTime.now(),
+          ),
+        );
+    debugPrint('[LanSyncService] Push failed for $id: $message');
+  }
+
+  Future<void> _clearFailure(String table, String entityId) async {
+    await (_localDb.delete(_localDb.syncQueue)
+          ..where((q) => q.id.equals('$table|$entityId')))
+        .go();
+  }
+
+  // ── Pull ─────────────────────────────────────────────────────────────────
+
+  Future<bool> _pullChanges() async {
+    for (var page = 0; page < 500; page++) {
+      final since = WorkstationConfig.current.lastRev;
+      final result = await _get('/api/changes', query: {
+        'since': '$since',
+        'limit': '$_pageSize',
+      });
+      if (result.statusCode != HttpStatus.ok || result.body?['ok'] != true) {
+        _fail(_describeFailure(result));
+        return false;
+      }
+      final body = result.body!;
+      for (final change in (body['changes'] as List<dynamic>? ?? [])) {
+        await _applyChange(change as Map<String, dynamic>);
+      }
+      await WorkstationConfig.saveLastRev(body['lastRev'] as int? ?? since);
+      if (body['hasMore'] != true) return true;
+    }
+    return true;
+  }
+
+  Future<void> _applyChange(Map<String, dynamic> change) async {
+    final table = change['table'] as String;
+    final spec = syncSpecFor(table);
+    final info = _infos[table];
+    final payload = change['row'] as Map<String, dynamic>?;
+    if (spec?.fromJson == null || info == null || payload == null) return;
+
+    final entityId = payload[syncPrimaryKey(table)] as String?;
+    if (entityId == null || entityId.isEmpty) return;
+    if (table == 'settings' &&
+        !isSharedSettingKey(payload['key'] as String? ?? '')) {
+      return;
+    }
+
+    final meta = await readSyncRowMeta(_localDb, table, entityId);
+    // A catalog row with local pending edits must reach the host first —
+    // pushing it is what surfaces the conflict honestly.
+    if (meta != null && meta.dirty && spec!.isCatalog) return;
+
+    await writeSyncRow(
+      _localDb,
+      table: table,
+      info: info,
+      row: spec!.fromJson!(payload)!,
+      entityId: entityId,
+      rev: change['rev'] as int? ?? 0,
+      dirty: false,
+      replaceOnConflict: true,
+    );
+  }
+
+  Future<void> _refreshPendingCount() async {
+    if (!_canSync) {
+      pendingSyncCountNotifier.value = 0;
+      return;
+    }
+    var total = 0;
+    for (final spec in syncTables) {
+      if (spec.table == 'settings') continue;
+      final rows = await _localDb.customSelect(
+        'SELECT COUNT(*) AS c FROM "${spec.table}" WHERE dirty = 1',
+      ).get();
+      total += rows.first.read<int>('c');
+    }
+    final settings = await _localDb.customSelect(
+      'SELECT COUNT(*) AS c FROM settings WHERE dirty = 1 AND ('
+      "key LIKE 'store.%' OR key LIKE 'receipt.%' "
+      "OR key = 'inventory.lowStockThreshold')",
+    ).get();
+    total += settings.first.read<int>('c');
+    pendingSyncCountNotifier.value = total;
+  }
+
+  // ── Presence ─────────────────────────────────────────────────────────────
 
   Future<void> _sendHeartbeat() async {
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
-
-    final client = HttpClient()..connectionTimeout = _httpTimeout;
+    if (!_canSync || _config.stationId.isEmpty) return;
     try {
-      final uri = Uri.http('${config.hostAddress}:${config.hostPort}', '/api/heartbeat');
-      final request = await client.postUrl(uri).timeout(_httpTimeout);
-      request.headers.contentType = ContentType.json;
-      final body = jsonEncode({
-        'id': _stationId,
-        'stationName': config.stationName.isNotEmpty
-            ? config.stationName
-            : Platform.localHostname,
-      });
-      request.headers.contentLength = utf8.encode(body).length;
-      request.write(body);
-      final response = await request.close().timeout(_httpTimeout);
-      await response.drain<void>();
-      isOnlineNotifier.value = response.statusCode == HttpStatus.ok;
+      final result = await _post(
+        '/api/heartbeat',
+        {
+          'id': _config.stationId,
+          'stationName': _config.stationName.isNotEmpty
+              ? _config.stationName
+              : Platform.localHostname,
+        },
+        authenticated: false,
+      );
+      isOnlineNotifier.value =
+          result.statusCode == HttpStatus.ok && result.body?['ok'] == true;
     } catch (e) {
       isOnlineNotifier.value = false;
       debugPrint('[LanSyncService] Heartbeat failed: $e');
-    } finally {
-      client.close();
     }
   }
 
   Future<void> _unregister() async {
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
+    if (!_canSync || _config.stationId.isEmpty) return;
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
     try {
-      final uri = Uri.http('${config.hostAddress}:${config.hostPort}', '/api/heartbeat/$_stationId');
-      final request = await client.deleteUrl(uri).timeout(const Duration(seconds: 2));
+      final uri = Uri.http(
+        '${_config.hostAddress}:${_config.hostPort}',
+        '/api/heartbeat/${_config.stationId}',
+      );
+      final request = await client
+          .deleteUrl(uri)
+          .timeout(const Duration(seconds: 2));
       final response = await request.close().timeout(const Duration(seconds: 2));
       await response.drain<void>();
     } catch (_) {
-      // Best-effort — server will expire us after 45s anyway
+      // Best-effort — the host expires us after 45s anyway.
     } finally {
       client.close();
     }
   }
 
-  // ── Catalog & Stock Sync (Host → Client) ──────────────────────────────────
+  // ── HTTP ─────────────────────────────────────────────────────────────────
 
-  Future<void> _syncCatalog() async {
-    if (_isSyncing) return;
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
-
-    _isSyncing = true;
+  Future<_ApiResult> _get(String path, {Map<String, String>? query}) async {
+    final config = _config;
+    if (config.hostAddress.isEmpty) {
+      return const _ApiResult(0, null);
+    }
     final client = HttpClient()..connectionTimeout = _httpTimeout;
     try {
-      final uri = Uri.http('${config.hostAddress}:${config.hostPort}', '/api/catalog');
+      final uri = Uri.http('${config.hostAddress}:${config.hostPort}', path, query);
       final request = await client.getUrl(uri).timeout(_httpTimeout);
+      _applyAuth(request, config);
       final response = await request.close().timeout(_httpTimeout);
-
-      if (response.statusCode != HttpStatus.ok) {
-        debugPrint('[LanSyncService] Catalog sync: bad status ${response.statusCode}');
-        return;
-      }
-
-      final body = await response.transform(utf8.decoder).join();
-      final data = jsonDecode(body) as Map<String, dynamic>;
-
-      await _localDb.transaction(() async {
-        // Users
-        for (final u in (data['users'] as List<dynamic>? ?? [])) {
-          final map = u as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final username = map['username'] as String;
-          final createdAt = map['createdAt'] != null
-              ? DateTime.parse(map['createdAt'] as String)
-              : DateTime.now();
-
-          final existing = await (_localDb.select(_localDb.users)
-                ..where((usr) => usr.id.equals(id) | usr.username.equals(username)))
-              .getSingleOrNull();
-
-          if (existing != null) {
-            await (_localDb.update(_localDb.users)
-                  ..where((usr) => usr.id.equals(existing.id)))
-                .write(
-              UsersCompanion(
-                id: Value(id),
-                username: Value(username),
-                displayName: Value(map['displayName'] as String),
-                passwordHash: Value(map['passwordHash'] as String),
-                role: Value(map['role'] as String),
-                isActive: Value(map['isActive'] as bool? ?? true),
-                createdAt: Value(createdAt),
-              ),
-            );
-          } else {
-            await _localDb.into(_localDb.users).insert(
-              UsersCompanion.insert(
-                id: id,
-                username: username,
-                displayName: map['displayName'] as String,
-                passwordHash: map['passwordHash'] as String,
-                role: map['role'] as String,
-                isActive: Value(map['isActive'] as bool? ?? true),
-                createdAt: Value(createdAt),
-              ),
-            );
-          }
-        }
-
-        // Categories
-        for (final c in (data['categories'] as List<dynamic>? ?? [])) {
-          final map = c as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final name = map['name'] as String;
-          final createdAt = map['createdAt'] != null
-              ? DateTime.parse(map['createdAt'] as String)
-              : DateTime.now();
-          final updatedAt = map['updatedAt'] != null
-              ? DateTime.parse(map['updatedAt'] as String)
-              : DateTime.now();
-
-          final existing = await (_localDb.select(_localDb.categories)
-                ..where((cat) => cat.id.equals(id) | cat.name.equals(name)))
-              .getSingleOrNull();
-
-          if (existing != null) {
-            await (_localDb.update(_localDb.categories)
-                  ..where((cat) => cat.id.equals(existing.id)))
-                .write(
-              CategoriesCompanion(
-                id: Value(id),
-                name: Value(name),
-                description: Value(map['description'] as String?),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          } else {
-            await _localDb.into(_localDb.categories).insert(
-              CategoriesCompanion.insert(
-                id: id,
-                name: name,
-                description: Value(map['description'] as String?),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          }
-        }
-
-        // Brands
-        for (final b in (data['brands'] as List<dynamic>? ?? [])) {
-          final map = b as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final name = map['name'] as String;
-          final createdAt = map['createdAt'] != null
-              ? DateTime.parse(map['createdAt'] as String)
-              : DateTime.now();
-          final updatedAt = map['updatedAt'] != null
-              ? DateTime.parse(map['updatedAt'] as String)
-              : DateTime.now();
-
-          final existing = await (_localDb.select(_localDb.brands)
-                ..where((brd) => brd.id.equals(id) | brd.name.equals(name)))
-              .getSingleOrNull();
-
-          if (existing != null) {
-            await (_localDb.update(_localDb.brands)
-                  ..where((brd) => brd.id.equals(existing.id)))
-                .write(
-              BrandsCompanion(
-                id: Value(id),
-                name: Value(name),
-                description: Value(map['description'] as String?),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          } else {
-            await _localDb.into(_localDb.brands).insert(
-              BrandsCompanion.insert(
-                id: id,
-                name: name,
-                description: Value(map['description'] as String?),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          }
-        }
-
-        // Products
-        for (final p in (data['products'] as List<dynamic>? ?? [])) {
-          final map = p as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final sku = map['sku'] as String;
-          ProductTrackingType trackingType = ProductTrackingType.quantity;
-          if (map['trackingType'] == 'serialized') {
-            trackingType = ProductTrackingType.serialized;
-          }
-          final createdAt = map['createdAt'] != null
-              ? DateTime.parse(map['createdAt'] as String)
-              : DateTime.now();
-          final updatedAt = map['updatedAt'] != null
-              ? DateTime.parse(map['updatedAt'] as String)
-              : DateTime.now();
-
-          final existing = await (_localDb.select(_localDb.products)
-                ..where((prd) => prd.id.equals(id) | prd.sku.equals(sku)))
-              .getSingleOrNull();
-
-          if (existing != null) {
-            await (_localDb.update(_localDb.products)
-                  ..where((prd) => prd.id.equals(existing.id)))
-                .write(
-              ProductsCompanion(
-                id: Value(id),
-                sku: Value(sku),
-                barcode: Value(map['barcode'] as String?),
-                name: Value(map['name'] as String),
-                categoryId: Value(map['categoryId'] as String?),
-                brandId: Value(map['brandId'] as String?),
-                description: Value(map['description'] as String?),
-                costPrice: Value((map['costPrice'] as num).toDouble()),
-                sellingPrice: Value((map['sellingPrice'] as num).toDouble()),
-                taxRate: Value((map['taxRate'] as num? ?? 0).toDouble()),
-                reorderLevel: Value((map['reorderLevel'] as num? ?? 0).toDouble()),
-                trackingType: Value(trackingType),
-                isActive: Value(map['isActive'] as bool? ?? true),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          } else {
-            await _localDb.into(_localDb.products).insert(
-              ProductsCompanion.insert(
-                id: id,
-                sku: sku,
-                barcode: Value(map['barcode'] as String?),
-                name: map['name'] as String,
-                categoryId: Value(map['categoryId'] as String?),
-                brandId: Value(map['brandId'] as String?),
-                description: Value(map['description'] as String?),
-                costPrice: (map['costPrice'] as num).toDouble(),
-                sellingPrice: (map['sellingPrice'] as num).toDouble(),
-                taxRate: Value((map['taxRate'] as num? ?? 0).toDouble()),
-                reorderLevel: Value((map['reorderLevel'] as num? ?? 0).toDouble()),
-                trackingType: Value(trackingType),
-                isActive: Value(map['isActive'] as bool? ?? true),
-                createdAt: Value(createdAt),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          }
-        }
-
-        // Settings
-        for (final s in (data['settings'] as List<dynamic>? ?? [])) {
-          final map = s as Map<String, dynamic>;
-          final key = map['key'] as String;
-          final value = map['value'] as String;
-          final updatedAt = map['updatedAt'] != null
-              ? DateTime.parse(map['updatedAt'] as String)
-              : DateTime.now();
-
-          final existing = await (_localDb.select(_localDb.settings)
-                ..where((st) => st.key.equals(key)))
-              .getSingleOrNull();
-
-          if (existing != null) {
-            await (_localDb.update(_localDb.settings)
-                  ..where((st) => st.key.equals(key)))
-                .write(
-              SettingsCompanion(
-                key: Value(key),
-                value: Value(value),
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          } else {
-            await _localDb.into(_localDb.settings).insert(
-              SettingsCompanion.insert(
-                key: key,
-                value: value,
-                updatedAt: Value(updatedAt),
-              ),
-            );
-          }
-        }
-
-        // Stock Movements (Master ledger from Host)
-        for (final m in (data['stockMovements'] as List<dynamic>? ?? [])) {
-          final map = m as Map<String, dynamic>;
-          final id = map['id'] as String;
-
-          final existing = await (_localDb.select(_localDb.stockMovements)
-                ..where((mov) => mov.id.equals(id)))
-              .getSingleOrNull();
-
-          if (existing == null) {
-            MovementType type = MovementType.openingStock;
-            try {
-              type = MovementType.values.byName(map['movementType'] as String);
-            } catch (_) {}
-
-            await _localDb.into(_localDb.stockMovements).insert(
-              StockMovementsCompanion(
-                id: Value(id),
-                productId: Value(map['productId'] as String),
-                movementType: Value(type),
-                quantity: Value((map['quantity'] as num).toDouble()),
-                referenceType: Value(map['referenceType'] as String?),
-                referenceId: Value(map['referenceId'] as String?),
-                userId: Value(map['userId'] as String?),
-                reason: Value(map['reason'] as String?),
-                createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-              ),
-            );
-          }
-        }
-
-        // Sales from Host (so client has matching sales history)
-        for (final s in (data['sales'] as List<dynamic>? ?? [])) {
-          final map = s as Map<String, dynamic>;
-          final id = map['id'] as String;
-
-          final existing = await (_localDb.select(_localDb.sales)
-                ..where((sale) => sale.id.equals(id)))
-              .getSingleOrNull();
-
-          if (existing == null) {
-            await _localDb.into(_localDb.sales).insert(
-              SalesCompanion(
-                id: Value(id),
-                receiptNumber: Value(map['receiptNumber'] as String),
-                customerId: Value(map['customerId'] as String?),
-                cashierId: Value(map['cashierId'] as String?),
-                subtotal: Value((map['subtotal'] as num).toDouble()),
-                discount: Value((map['discount'] as num? ?? 0).toDouble()),
-                tax: Value((map['tax'] as num? ?? 0).toDouble()),
-                total: Value((map['total'] as num).toDouble()),
-                paymentStatus: Value(map['paymentStatus'] as String? ?? 'PAID'),
-                saleStatus: Value(map['saleStatus'] as String? ?? 'COMPLETED'),
-                isSynced: const Value(true),
-                createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-                updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-              ),
-            );
-          }
-        }
-
-        // Sale Items from Host
-        for (final item in (data['saleItems'] as List<dynamic>? ?? [])) {
-          final map = item as Map<String, dynamic>;
-          final id = map['id'] as String;
-
-          final existing = await (_localDb.select(_localDb.saleItems)
-                ..where((it) => it.id.equals(id)))
-              .getSingleOrNull();
-
-          if (existing == null) {
-            await _localDb.into(_localDb.saleItems).insert(
-              SaleItemsCompanion(
-                id: Value(id),
-                saleId: Value(map['saleId'] as String),
-                productId: Value(map['productId'] as String),
-                quantity: Value((map['quantity'] as num).toDouble()),
-                unitPrice: Value((map['unitPrice'] as num).toDouble()),
-                discount: Value((map['discount'] as num? ?? 0).toDouble()),
-                tax: Value((map['tax'] as num? ?? 0).toDouble()),
-                subtotal: Value((map['subtotal'] as num).toDouble()),
-                serialNumberId: Value(map['serialNumberId'] as String?),
-              ),
-            );
-          }
-        }
-
-        // Payments from Host
-        for (final p in (data['payments'] as List<dynamic>? ?? [])) {
-          final map = p as Map<String, dynamic>;
-          final id = map['id'] as String;
-
-          final existing = await (_localDb.select(_localDb.payments)
-                ..where((pm) => pm.id.equals(id)))
-              .getSingleOrNull();
-
-          if (existing == null) {
-            PaymentMethod method = PaymentMethod.cash;
-            try {
-              method = PaymentMethod.values.byName(map['paymentMethod'] as String);
-            } catch (_) {}
-
-            await _localDb.into(_localDb.payments).insert(
-              PaymentsCompanion(
-                id: Value(id),
-                saleId: Value(map['saleId'] as String),
-                paymentMethod: Value(method),
-                amount: Value((map['amount'] as num).toDouble()),
-                reference: Value(map['reference'] as String?),
-                createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-              ),
-            );
-          }
-        }
-      });
-
-      // Notify Riverpod streams across the client app that all tables have changed
-      _localDb.markTablesUpdated({
-        _localDb.users,
-        _localDb.categories,
-        _localDb.brands,
-        _localDb.products,
-        _localDb.settings,
-        _localDb.stockMovements,
-        _localDb.sales,
-        _localDb.saleItems,
-        _localDb.payments,
-      });
-
-      debugPrint('[LanSyncService] Full catalog + stock sync complete.');
-    } catch (e) {
-      debugPrint('[LanSyncService] Catalog sync error: $e');
+      return await _readResult(response);
+    } catch (_) {
+      return const _ApiResult(0, null);
     } finally {
-      _isSyncing = false;
       client.close();
     }
   }
 
-  // ── Sales push (Client → Host) ───────────────────────────────────────────
-
-  Future<void> _pushOfflineSales() async {
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
-
+  Future<_ApiResult> _post(
+    String path,
+    Object body, {
+    bool authenticated = true,
+  }) async {
+    final config = _config;
+    if (config.hostAddress.isEmpty) {
+      return const _ApiResult(0, null);
+    }
+    final client = HttpClient()..connectionTimeout = _httpTimeout;
     try {
-      final unsyncedSales = await (_localDb.select(_localDb.sales)
-            ..where((s) => s.isSynced.equals(false)))
-          .get();
-
-      if (unsyncedSales.isEmpty) {
-        pendingSyncCountNotifier.value = 0;
-        return;
-      }
-
-      pendingSyncCountNotifier.value = unsyncedSales.length;
-
-      final salesPayload = <Map<String, dynamic>>[];
-      for (final sale in unsyncedSales) {
-        final items = await (_localDb.select(_localDb.saleItems)
-              ..where((i) => i.saleId.equals(sale.id)))
-            .get();
-        final payments = await (_localDb.select(_localDb.payments)
-              ..where((p) => p.saleId.equals(sale.id)))
-            .get();
-
-        salesPayload.add({
-          'id': sale.id,
-          'receiptNumber': sale.receiptNumber,
-          'customerId': sale.customerId,
-          'cashierId': sale.cashierId,
-          'subtotal': sale.subtotal,
-          'discount': sale.discount,
-          'tax': sale.tax,
-          'total': sale.total,
-          'paymentStatus': sale.paymentStatus,
-          'saleStatus': sale.saleStatus,
-          'createdAt': sale.createdAt.toIso8601String(),
-          'updatedAt': sale.updatedAt.toIso8601String(),
-          'items': [
-            for (final item in items)
-              {
-                'id': item.id,
-                'saleId': item.saleId,
-                'productId': item.productId,
-                'quantity': item.quantity,
-                'unitPrice': item.unitPrice,
-                'discount': item.discount,
-                'tax': item.tax,
-                'subtotal': item.subtotal,
-                'serialNumberId': item.serialNumberId,
-              },
-          ],
-          'payments': [
-            for (final p in payments)
-              {
-                'id': p.id,
-                'saleId': p.saleId,
-                'paymentMethod': p.paymentMethod.name,
-                'amount': p.amount,
-                'reference': p.reference,
-                'createdAt': p.createdAt.toIso8601String(),
-              },
-          ],
-        });
-      }
-
-      final client = HttpClient()..connectionTimeout = _httpTimeout;
-      try {
-        final uri = Uri.http('${config.hostAddress}:${config.hostPort}', '/api/sales');
-        final request = await client.postUrl(uri).timeout(_httpTimeout);
-        request.headers.contentType = ContentType.json;
-        final body = jsonEncode({'sales': salesPayload});
-        request.headers.contentLength = utf8.encode(body).length;
-        request.write(body);
-        final response = await request.close().timeout(_httpTimeout);
-        final responseBody = await response.transform(utf8.decoder).join();
-
-        if (response.statusCode == HttpStatus.ok) {
-          final result = jsonDecode(responseBody) as Map<String, dynamic>;
-          final synced = result['synced'] as int? ?? 0;
-          if (synced > 0) {
-            // Mark local sales as synced
-            for (final sale in unsyncedSales.take(synced)) {
-              await (_localDb.update(_localDb.sales)
-                    ..where((s) => s.id.equals(sale.id)))
-                  .write(const SalesCompanion(isSynced: Value(true)));
-            }
-            debugPrint('[LanSyncService] Pushed $synced offline sales to host.');
-          }
-        }
-      } finally {
-        client.close();
-      }
-
-      // Recount
-      final remaining = await (_localDb.select(_localDb.sales)
-            ..where((s) => s.isSynced.equals(false)))
-          .get();
-      pendingSyncCountNotifier.value = remaining.length;
-    } catch (e) {
-      debugPrint('[LanSyncService] Sales push error: $e');
+      final uri = Uri.http('${config.hostAddress}:${config.hostPort}', path);
+      final request = await client.postUrl(uri).timeout(_httpTimeout);
+      _applyAuth(request, config, enabled: authenticated);
+      final encoded = jsonEncode(body);
+      request.headers.contentType = ContentType.json;
+      request.headers.contentLength = utf8.encode(encoded).length;
+      request.write(encoded);
+      final response = await request.close().timeout(_httpTimeout);
+      return await _readResult(response);
+    } catch (_) {
+      return const _ApiResult(0, null);
+    } finally {
+      client.close();
     }
   }
 
-  // ── Push Client-Created Products & Stock Movements (Client → Host) ─────────
-
-  Future<void> _pushClientChanges() async {
-    final config = WorkstationConfig.current;
-    if (!config.isClient || config.hostAddress.isEmpty) return;
-
-    try {
-      final products = await _localDb.select(_localDb.products).get();
-      final movements = await _localDb.select(_localDb.stockMovements).get();
-      final categories = await _localDb.select(_localDb.categories).get();
-      final brands = await _localDb.select(_localDb.brands).get();
-
-      final client = HttpClient()..connectionTimeout = _httpTimeout;
-      try {
-        final uri = Uri.http('${config.hostAddress}:${config.hostPort}', '/api/sync/push');
-        final request = await client.postUrl(uri).timeout(_httpTimeout);
-        request.headers.contentType = ContentType.json;
-        final body = jsonEncode({
-          'categories': [
-            for (final c in categories)
-              {
-                'id': c.id,
-                'name': c.name,
-                'description': c.description,
-                'createdAt': c.createdAt.toIso8601String(),
-                'updatedAt': c.updatedAt.toIso8601String(),
-              },
-          ],
-          'brands': [
-            for (final b in brands)
-              {
-                'id': b.id,
-                'name': b.name,
-                'description': b.description,
-                'createdAt': b.createdAt.toIso8601String(),
-                'updatedAt': b.updatedAt.toIso8601String(),
-              },
-          ],
-          'products': [
-            for (final p in products)
-              {
-                'id': p.id,
-                'sku': p.sku,
-                'barcode': p.barcode,
-                'name': p.name,
-                'categoryId': p.categoryId,
-                'brandId': p.brandId,
-                'description': p.description,
-                'costPrice': p.costPrice,
-                'sellingPrice': p.sellingPrice,
-                'taxRate': p.taxRate,
-                'reorderLevel': p.reorderLevel,
-                'trackingType': p.trackingType.name,
-                'isActive': p.isActive,
-                'createdAt': p.createdAt.toIso8601String(),
-                'updatedAt': p.updatedAt.toIso8601String(),
-              },
-          ],
-          'stockMovements': [
-            for (final m in movements)
-              {
-                'id': m.id,
-                'productId': m.productId,
-                'movementType': m.movementType.name,
-                'quantity': m.quantity,
-                'referenceType': m.referenceType,
-                'referenceId': m.referenceId,
-                'userId': m.userId,
-                'reason': m.reason,
-                'createdAt': m.createdAt.toIso8601String(),
-              },
-          ],
-        });
-        request.headers.contentLength = utf8.encode(body).length;
-        request.write(body);
-        final response = await request.close().timeout(_httpTimeout);
-        await response.drain<void>();
-      } finally {
-        client.close();
-      }
-    } catch (e) {
-      debugPrint('[LanSyncService] Push client changes error: $e');
-    }
+  void _applyAuth(
+    HttpClientRequest request,
+    WorkstationConfig config, {
+    bool enabled = true,
+  }) {
+    if (!enabled) return;
+    request.headers.set('X-Station-Id', config.stationId);
+    request.headers.set(
+      'X-Auth-Token',
+      syncToken(pin: config.securityPin, stationId: config.stationId),
+    );
   }
+
+  Future<_ApiResult> _readResult(HttpClientResponse response) async {
+    final raw = await response.transform(utf8.decoder).join();
+    Map<String, dynamic>? body;
+    if (raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map<String, dynamic>) body = decoded;
+      } catch (_) {
+        body = null;
+      }
+    }
+    return _ApiResult(response.statusCode, body);
+  }
+}
+
+class _ApiResult {
+  const _ApiResult(this.statusCode, this.body);
+
+  final int statusCode;
+  final Map<String, dynamic>? body;
 }
 
 /// Singleton provider for the LAN synchronization service.

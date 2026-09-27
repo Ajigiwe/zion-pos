@@ -3,6 +3,7 @@ import 'package:instrument_pos/core/database/app_database.dart';
 import 'package:instrument_pos/core/database/lan_sync_service.dart';
 import 'package:instrument_pos/core/database/tables.dart';
 import 'package:instrument_pos/core/database/workstation_config.dart';
+import 'package:instrument_pos/core/numbering/document_numbers.dart';
 import 'package:instrument_pos/features/audit/data/audit_repository.dart';
 import 'package:instrument_pos/features/sales/domain/receipt.dart';
 import 'package:instrument_pos/features/sales/domain/sale_totals.dart';
@@ -256,13 +257,12 @@ class DriftSaleRepository implements SaleRepository {
     };
   }
 
-  Future<String> _nextReceiptNumber() async {
-    final statement = _db.selectOnly(_db.sales)
-      ..addColumns([_db.sales.id.count()]);
-    final count = await statement.getSingle();
-    final next = (count.read(_db.sales.id.count()) ?? 0) + 1;
-    return 'SA-${next.toString().padLeft(5, '0')}';
-  }
+  Future<String> _nextReceiptNumber() => nextDocumentNumber(
+    _db,
+    table: 'sales',
+    column: 'receipt_number',
+    prefix: 'SA',
+  );
 
   static String _qty(double value) => value == value.roundToDouble()
       ? value.toStringAsFixed(0)

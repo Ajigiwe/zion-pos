@@ -1,6 +1,7 @@
 import 'package:drift/drift.dart';
 import 'package:instrument_pos/core/database/app_database.dart';
 import 'package:instrument_pos/core/database/tables.dart';
+import 'package:instrument_pos/core/numbering/document_numbers.dart';
 import 'package:instrument_pos/core/store_info.dart';
 import 'package:instrument_pos/features/audit/data/audit_repository.dart';
 import 'package:instrument_pos/features/refunds/domain/refund_models.dart';
@@ -578,26 +579,26 @@ class DriftRefundsRepository implements RefundsRepository {
     };
   }
 
-  Future<String> _nextSaleNumber() async {
-    final statement = _db.selectOnly(_db.sales)
-      ..addColumns([_db.sales.id.count()]);
-    final row = await statement.getSingle();
-    return _formatNumber((row.read(_db.sales.id.count()) ?? 0) + 1, 'SA');
-  }
+  Future<String> _nextSaleNumber() => nextDocumentNumber(
+    _db,
+    table: 'sales',
+    column: 'receipt_number',
+    prefix: 'SA',
+  );
 
-  Future<String> _nextRefundNumber() async {
-    final statement = _db.selectOnly(_db.refunds)
-      ..addColumns([_db.refunds.id.count()]);
-    final row = await statement.getSingle();
-    return _formatNumber((row.read(_db.refunds.id.count()) ?? 0) + 1, 'RF');
-  }
+  Future<String> _nextRefundNumber() => nextDocumentNumber(
+    _db,
+    table: 'refunds',
+    column: 'refund_number',
+    prefix: 'RF',
+  );
 
-  Future<String> _nextExchangeNumber() async {
-    final statement = _db.selectOnly(_db.exchanges)
-      ..addColumns([_db.exchanges.id.count()]);
-    final row = await statement.getSingle();
-    return _formatNumber((row.read(_db.exchanges.id.count()) ?? 0) + 1, 'EX');
-  }
+  Future<String> _nextExchangeNumber() => nextDocumentNumber(
+    _db,
+    table: 'exchanges',
+    column: 'exchange_number',
+    prefix: 'EX',
+  );
 
   @override
   Future<ReceiptContent> getRefundReceipt(
@@ -760,9 +761,6 @@ class DriftRefundsRepository implements RefundsRepository {
       customization: customization,
     );
   }
-
-  static String _formatNumber(int value, String prefix) =>
-      '$prefix-${value.toString().padLeft(5, '0')}';
 
   static String _qty(double value) => value == value.roundToDouble()
       ? value.toStringAsFixed(0)

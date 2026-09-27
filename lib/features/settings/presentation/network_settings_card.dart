@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:instrument_pos/core/app_restart.dart';
 import 'package:instrument_pos/core/database/lan_database_client.dart';
 import 'package:instrument_pos/core/database/lan_database_server.dart';
+import 'package:instrument_pos/core/database/lan_sync_service.dart';
 import 'package:instrument_pos/features/auth/presentation/session_provider.dart';
 import 'package:instrument_pos/features/settings/domain/network_settings.dart';
 import 'package:instrument_pos/features/settings/presentation/network_settings_providers.dart';
@@ -430,38 +431,53 @@ class _NetworkSettingsCardState extends ConsumerState<NetworkSettingsCard> {
           // Status & Connected Clients
           Row(
             children: [
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 4,
-                ),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFDCFCE7),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFF86EFAC)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: const BoxDecoration(
-                        color: Color(0xFF16A34A),
-                        shape: BoxShape.circle,
+              ValueListenableBuilder<bool>(
+                valueListenable: server.isRunningNotifier,
+                builder: (context, running, _) {
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: running
+                          ? const Color(0xFFDCFCE7)
+                          : const Color(0xFFFEE2E2),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: running
+                            ? const Color(0xFF86EFAC)
+                            : const Color(0xFFFECACA),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    const Text(
-                      'HOST SERVER RUNNING',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFF15803D),
-                      ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: running
+                                ? const Color(0xFF16A34A)
+                                : const Color(0xFFDC2626),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          running ? 'HOST SERVER RUNNING' : 'HOST SERVER DOWN',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: running
+                                ? const Color(0xFF15803D)
+                                : const Color(0xFFB91C1C),
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
+                  );
+                },
               ),
               const Spacer(),
               ValueListenableBuilder<int>(
@@ -800,6 +816,109 @@ class _NetworkSettingsCardState extends ConsumerState<NetworkSettingsCard> {
           ),
           const SizedBox(height: 16),
 
+          // Live sync status: is this terminal talking to the host right now,
+          // what is it doing, and how many rows are still waiting to travel.
+          Row(
+            children: [
+              ValueListenableBuilder<bool>(
+                valueListenable:
+                    ref.watch(lanSyncServiceProvider).isOnlineNotifier,
+                builder: (context, online, _) {
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: online
+                          ? const Color(0xFFDCFCE7)
+                          : const Color(0xFFFEE2E2),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: online
+                            ? const Color(0xFF86EFAC)
+                            : const Color(0xFFFECACA),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: online
+                                ? const Color(0xFF16A34A)
+                                : const Color(0xFFDC2626),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          online ? 'CONNECTED TO HOST' : 'HOST UNREACHABLE',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: online
+                                ? const Color(0xFF15803D)
+                                : const Color(0xFFB91C1C),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ValueListenableBuilder<String>(
+                  valueListenable:
+                      ref.watch(lanSyncServiceProvider).statusNotifier,
+                  builder: (context, status, _) {
+                    return Text(
+                      status,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: isDark
+                            ? const Color(0xFF94A3B8)
+                            : const Color(0xFF64748B),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              ValueListenableBuilder<int>(
+                valueListenable:
+                    ref.watch(lanSyncServiceProvider).pendingSyncCountNotifier,
+                builder: (context, pending, _) {
+                  if (pending == 0) return const SizedBox.shrink();
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFEF3C7),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFFFDE68A)),
+                    ),
+                    child: Text(
+                      '$pending waiting',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF92400E),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+
           // IP, Port, PIN
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -848,8 +967,10 @@ class _NetworkSettingsCardState extends ConsumerState<NetworkSettingsCard> {
           ),
           const SizedBox(height: 14),
 
-          // Test Connection & Save Action Row
-          Row(
+          // Test Connection & Save Action Row (wraps on narrow terminals)
+          Wrap(
+            spacing: 10,
+            runSpacing: 8,
             children: [
               OutlinedButton.icon(
                 onPressed: _testingConnection ? null : _testPing,
@@ -864,11 +985,15 @@ class _NetworkSettingsCardState extends ConsumerState<NetworkSettingsCard> {
                   _testingConnection ? 'Testing…' : 'Test Connection',
                 ),
               ),
-              const SizedBox(width: 10),
               FilledButton.icon(
                 onPressed: _saveClientConfig,
                 icon: const Icon(Icons.check_rounded, size: 16),
                 label: const Text('Save & Connect'),
+              ),
+              OutlinedButton.icon(
+                onPressed: LanSyncService.triggerSync,
+                icon: const Icon(Icons.sync_rounded, size: 16),
+                label: const Text('Sync Now'),
               ),
             ],
           ),

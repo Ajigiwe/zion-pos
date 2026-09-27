@@ -5,8 +5,9 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
 import 'package:instrument_pos/core/database/app_database.dart';
-import 'package:instrument_pos/core/database/tables.dart';
+import 'package:instrument_pos/core/database/sync_schema.dart';
 import 'package:instrument_pos/core/security/passwords.dart';
+import 'package:instrument_pos/core/security/sync_auth.dart';
 
 /// Represents an active secondary POS terminal tracked via HTTP heartbeats.
 class ConnectedClientSession {
@@ -31,17 +32,22 @@ class ConnectedClientSession {
   }
 }
 
-/// LAN Server that exposes the local SQLite database to secondary POS terminals
-/// over the local store network via a simple HTTP REST API.
+/// Host station HTTP API.
 ///
-/// Design: stateless HTTP endpoints — no persistent WebSocket connections.
-/// Presence is tracked via periodic heartbeats from each client terminal.
+/// The protocol is a three-step delta sync (`/api/hello` → `/api/outbox` →
+/// `/api/changes`) instead of the old full-state dump, so a terminal can work
+/// against a host that restarts, disappears mid-shift or is the shop owner's
+/// laptop. Presence stays on unauthenticated heartbeats; every endpoint that
+/// touches rows requires a token derived from the pairing PIN.
 class LanDatabaseServer {
   LanDatabaseServer(this._db);
 
   final AppDatabase _db;
   HttpServer? _server;
   String? _securityPin;
+
+  late final Map<String, TableInfo<Table, DataClass>> _infos =
+      syncTableInfos(_db);
 
   // Heartbeat-based presence: stationId -> session
   final Map<String, ConnectedClientSession> _clients = {};
@@ -67,8 +73,10 @@ class LanDatabaseServer {
       isRunningNotifier.value = true;
       debugPrint('[LanDatabaseServer] Started on port ${_server!.port}');
 
-      // Expire stale clients every 15s
-      _expiryTimer = Timer.periodic(const Duration(seconds: 15), (_) => _expireStaleClients());
+      _expiryTimer = Timer.periodic(
+        const Duration(seconds: 15),
+        (_) => _expireStaleClients(),
+      );
 
       _server!.listen(
         (HttpRequest request) => _handleRequest(request),
@@ -106,10 +114,16 @@ class LanDatabaseServer {
   Future<void> _handleRequest(HttpRequest request) async {
     final path = request.uri.path;
 
-    // CORS
-    request.response.headers.add('Access-Control-Allow-Origin', '*');
-    request.response.headers.add('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    request.response.headers.add('Access-Control-Allow-Headers', 'Origin, Content-Type, X-Auth-Token, X-Station-Name, X-Station-Id');
+    request.response.headers
+      ..add('Access-Control-Allow-Origin', '*')
+      ..add(
+        'Access-Control-Allow-Methods',
+        'GET, POST, DELETE, OPTIONS',
+      )
+      ..add(
+        'Access-Control-Allow-Headers',
+        'Origin, Content-Type, X-Auth-Token, X-Station-Name, X-Station-Id',
+      );
 
     if (request.method == 'OPTIONS') {
       request.response.statusCode = HttpStatus.ok;
@@ -148,33 +162,323 @@ class LanDatabaseServer {
       if (_clients.containsKey(id)) {
         final session = _clients.remove(id);
         _notifyClients();
-        debugPrint('[LanDatabaseServer] Client disconnected gracefully: ${session?.stationName}');
+        debugPrint(
+          '[LanDatabaseServer] Client disconnected gracefully: '
+          '${session?.stationName}',
+        );
       }
       _writeJson(request, {'ok': true});
       return;
     }
 
-    // --- /api/catalog (GET) — full catalog and stock dump for client sync ---
-    if (path == '/api/catalog' && request.method == 'GET') {
-      await _handleCatalog(request);
+    // --- /api/hello (POST) — schema + cursor handshake before syncing ---
+    if (path == '/api/hello' && request.method == 'POST') {
+      await _withSyncAuth(request, _handleHello);
       return;
     }
 
-    // --- /api/sales (POST) — client uploads offline sales ---
-    if (path == '/api/sales' && request.method == 'POST') {
-      await _handleSalesUpload(request);
+    // --- /api/outbox (POST) — client changes accepted by the host ---
+    if (path == '/api/outbox' && request.method == 'POST') {
+      await _withSyncAuth(request, _handleOutbox);
       return;
     }
 
-    // --- /api/sync/push (POST) — client uploads changes made on workstation ---
-    if (path == '/api/sync/push' && request.method == 'POST') {
-      await _handleClientPush(request);
+    // --- /api/changes (GET) — delta pull for a client cursor ---
+    if (path == '/api/changes' && request.method == 'GET') {
+      await _withSyncAuth(request, _handleChanges);
       return;
     }
 
     request.response.statusCode = HttpStatus.notFound;
     request.response.write('POS LAN Server - Not Found');
     await request.response.close();
+  }
+
+  /// Rejects sync traffic before it is parsed unless the station proves it
+  /// knows the pairing PIN.
+  Future<void> _withSyncAuth(
+    HttpRequest request,
+    Future<void> Function(HttpRequest request) handler,
+  ) async {
+    final pin = (_securityPin ?? '').trim();
+    if (pin.isEmpty) {
+      request.response.statusCode = HttpStatus.forbidden;
+      _writeJson(request, {
+        'ok': false,
+        'error': 'pin_required',
+        'message': 'Set a security PIN on the host station to enable sync.',
+      });
+      return;
+    }
+    final stationId = request.headers.value('X-Station-Id') ?? '';
+    final token = request.headers.value('X-Auth-Token');
+    if (!verifySyncToken(pin: pin, stationId: stationId, token: token)) {
+      request.response.statusCode = HttpStatus.unauthorized;
+      _writeJson(request, {'ok': false, 'error': 'unauthorized'});
+      return;
+    }
+    await handler(request);
+  }
+
+  Future<void> _handleHello(HttpRequest request) async {
+    try {
+      final body = await utf8.decoder.bind(request).join();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final schemaVersion = json['schemaVersion'] as int? ?? -1;
+      final clientLastRev = json['lastRev'] as int? ?? 0;
+
+      if (schemaVersion != AppDatabase.currentSchemaVersion) {
+        request.response.statusCode = HttpStatus.upgradeRequired;
+        _writeJson(request, {
+          'ok': false,
+          'error': 'schema_mismatch',
+          'schemaVersion': AppDatabase.currentSchemaVersion,
+        });
+        return;
+      }
+
+      final serverRev = await currentRev(_db);
+      _writeJson(request, {
+        'ok': true,
+        'schemaVersion': AppDatabase.currentSchemaVersion,
+        'serverRev': serverRev,
+        // The host database was rebuilt under us: start the cursor over.
+        'forceFullSync': clientLastRev > serverRev,
+      });
+    } catch (e) {
+      debugPrint('[LanDatabaseServer] /api/hello error: $e');
+      request.response.statusCode = HttpStatus.internalServerError;
+      _writeJson(request, {'ok': false, 'error': e.toString()});
+    }
+  }
+
+  Future<void> _handleHeartbeat(HttpRequest request) async {
+    try {
+      final body = await utf8.decoder.bind(request).join();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final id = json['id'] as String? ?? '';
+      final stationName = json['stationName'] as String? ?? 'Unknown Terminal';
+      final clientIp =
+          request.connectionInfo?.remoteAddress.address ?? '0.0.0.0';
+
+      if (id.isEmpty) {
+        request.response.statusCode = HttpStatus.badRequest;
+        _writeJson(request, {'ok': false});
+        return;
+      }
+
+      if (_clients.containsKey(id)) {
+        _clients[id]!.lastHeartbeat = DateTime.now();
+      } else {
+        _clients[id] = ConnectedClientSession(
+          id: id,
+          remoteIp: clientIp,
+          stationName: stationName,
+          connectedAt: DateTime.now(),
+        );
+        debugPrint('[LanDatabaseServer] New client: $stationName ($clientIp)');
+        _notifyClients();
+      }
+
+      _writeJson(request, {
+        'ok': true,
+        'serverTime': DateTime.now().toIso8601String(),
+        'serverRev': await currentRev(_db),
+        'schemaVersion': AppDatabase.currentSchemaVersion,
+      });
+    } catch (e) {
+      debugPrint('[LanDatabaseServer] /api/heartbeat error: $e');
+      request.response.statusCode = HttpStatus.internalServerError;
+      _writeJson(request, {'ok': false});
+    }
+  }
+
+  /// Returns every row with `rev >= since`, oldest first, up to [limit].
+  ///
+  /// Paging finds the boundary revision first so a page can never split a
+  /// revision across requests — a client always resumes with
+  /// `since = lastRev it applied`, which is idempotent because applying a row
+  /// twice is a no-op.
+  Future<void> _handleChanges(HttpRequest request) async {
+    try {
+      final since =
+          int.tryParse(request.uri.queryParameters['since'] ?? '') ?? 0;
+      var limit =
+          int.tryParse(request.uri.queryParameters['limit'] ?? '') ?? 500;
+      if (limit < 1) limit = 1;
+      if (limit > 2000) limit = 2000;
+
+      final union = [
+        for (final spec in syncTables)
+          'SELECT rev FROM "${spec.table}" WHERE rev >= ?',
+      ].join(' UNION ALL ');
+      final boundaryRows = await _db.customSelect(
+        'SELECT rev FROM ($union) ORDER BY rev ASC LIMIT 1 OFFSET ?',
+        variables: [
+          for (var i = 0; i < syncTables.length; i++) Variable.withInt(since),
+          Variable.withInt(limit - 1),
+        ],
+      ).get();
+      final rawBoundary =
+          boundaryRows.isEmpty ? null : boundaryRows.first.read<int>('rev');
+      // A revision older than the cursor means `limit` rows share one
+      // revision; revs are unique per row in practice, so this is a guard
+      // against paging forever on the same cursor.
+      final boundary =
+          rawBoundary != null && rawBoundary > since ? rawBoundary : null;
+
+      final changes = <Map<String, dynamic>>[];
+      var lastRev = since;
+      for (final spec in syncTables) {
+        final info = _infos[spec.table]!;
+        final rows = await selectSyncRows(
+          _db,
+          info,
+          where: boundary != null
+              ? 'rev >= $since AND rev <= $boundary'
+              : 'rev >= $since',
+        );
+        for (final row in rows) {
+          final payload = row.toJson();
+          if (spec.table == 'settings' &&
+              !isSharedSettingKey(payload['key'] as String? ?? '')) {
+            continue;
+          }
+          final rev = payload['rev'] as int;
+          if (rev > lastRev) lastRev = rev;
+          changes.add({'table': spec.table, 'rev': rev, 'row': payload});
+        }
+      }
+      changes.sort((a, b) => (a['rev'] as int).compareTo(b['rev'] as int));
+
+      _writeJson(request, {
+        'ok': true,
+        'since': since,
+        'lastRev': boundary ?? lastRev,
+        'serverRev': await currentRev(_db),
+        'hasMore': boundary != null,
+        'changes': changes,
+      });
+    } catch (e) {
+      debugPrint('[LanDatabaseServer] /api/changes error: $e');
+      request.response.statusCode = HttpStatus.internalServerError;
+      _writeJson(request, {'ok': false, 'error': e.toString()});
+    }
+  }
+
+  /// Accepts a batch of client operations.
+  ///
+  /// Catalog rows are conflict-checked against `baseRev` (the revision the
+  /// client last saw); transaction rows are appended once, keyed by primary
+  /// key, so a retried push is a no-op.
+  Future<void> _handleOutbox(HttpRequest request) async {
+    try {
+      final body = await utf8.decoder.bind(request).join();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final ops = (json['ops'] as List<dynamic>? ?? [])
+          .cast<Map<String, dynamic>>();
+
+      final results = <Map<String, dynamic>>[];
+      for (final op in ops) {
+        results.add(await _applyOp(op));
+      }
+
+      _writeJson(request, {'ok': true, 'results': results});
+    } catch (e) {
+      debugPrint('[LanDatabaseServer] /api/outbox error: $e');
+      request.response.statusCode = HttpStatus.internalServerError;
+      _writeJson(request, {'ok': false, 'error': e.toString()});
+    }
+  }
+
+  Future<Map<String, dynamic>> _applyOp(Map<String, dynamic> op) async {
+    final opId = op['opId'] as String? ?? '';
+    final table = op['table'] as String? ?? '';
+    final payload = op['payload'] as Map<String, dynamic>?;
+    final spec = syncSpecFor(table);
+    if (spec == null || spec.fromJson == null || payload == null) {
+      return {'opId': opId, 'status': 'error', 'message': 'unsupported op'};
+    }
+
+    final info = _infos[table]!;
+    final pk = syncPrimaryKey(table);
+    final entityId = payload[pk]?.toString() ?? '';
+    if (entityId.isEmpty) {
+      return {'opId': opId, 'status': 'error', 'message': 'missing key'};
+    }
+    if (table == 'settings' && !isSharedSettingKey(entityId)) {
+      return {'opId': opId, 'status': 'ignored'};
+    }
+
+    final row = spec.fromJson!(payload)!;
+    final existing = await readSyncRowMeta(_db, table, entityId);
+
+    if (existing != null && spec.kind == SyncKind.tx) {
+      return {'opId': opId, 'status': 'duplicate', 'rev': existing.rev};
+    }
+    if (existing != null && (op['baseRev'] as int? ?? -1) != existing.rev) {
+      return {
+        'opId': opId,
+        'status': 'conflict',
+        'code': 'stale',
+        'rev': existing.rev,
+        'row': await readSyncRowJson(_db, table, info, entityId),
+      };
+    }
+
+    final rev = await nextRev(_db);
+    try {
+      await writeSyncRow(
+        _db,
+        table: table,
+        info: info,
+        row: row,
+        entityId: entityId,
+        rev: rev,
+        dirty: false,
+      );
+    } catch (e) {
+      final unique = await _uniqueConflict(opId, table, info, payload, e);
+      return unique ??
+          <String, dynamic>{'opId': opId, 'status': 'error', 'message': '$e'};
+    }
+    return {'opId': opId, 'status': 'applied', 'rev': rev};
+  }
+
+  /// Turns a UNIQUE violation into a conflict carrying the row that owns the
+  /// value (same SKU on two stations, same receipt number, …) so the client
+  /// can resolve it instead of retrying forever.
+  Future<Map<String, dynamic>?> _uniqueConflict(
+    String opId,
+    String table,
+    TableInfo<Table, DataClass> info,
+    Map<String, dynamic> payload,
+    Object error,
+  ) async {
+    final match = RegExp(
+      r'UNIQUE constraint failed:\s*[\w]+\.(?<column>\w+)',
+    ).firstMatch(error.toString());
+    final column = match?.namedGroup('column');
+    if (column == null) return null;
+    final value = payload[column];
+    if (value is! String || value.isEmpty) return null;
+
+    final rows = await selectSyncRows(
+      _db,
+      info,
+      where: '"$column" = ${sqlLiteral(value)}',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final clash = rows.first.toJson();
+    return {
+      'opId': opId,
+      'status': 'conflict',
+      'code': 'unique',
+      'column': column,
+      'rev': clash['rev'],
+      'row': clash,
+    };
   }
 
   Future<void> _handleAuth(HttpRequest request) async {
@@ -216,522 +520,6 @@ class LanDatabaseServer {
       debugPrint('[LanDatabaseServer] /auth error: $e');
       request.response.statusCode = HttpStatus.internalServerError;
       _writeJson(request, {'success': false, 'message': 'Server error'});
-    }
-  }
-
-  Future<void> _handleHeartbeat(HttpRequest request) async {
-    try {
-      final body = await utf8.decoder.bind(request).join();
-      final json = jsonDecode(body) as Map<String, dynamic>;
-      final id = json['id'] as String? ?? '';
-      final stationName = json['stationName'] as String? ?? 'Unknown Terminal';
-      final clientIp = request.connectionInfo?.remoteAddress.address ?? '0.0.0.0';
-
-      if (id.isEmpty) {
-        request.response.statusCode = HttpStatus.badRequest;
-        _writeJson(request, {'ok': false});
-        return;
-      }
-
-      if (_clients.containsKey(id)) {
-        _clients[id]!.lastHeartbeat = DateTime.now();
-      } else {
-        _clients[id] = ConnectedClientSession(
-          id: id,
-          remoteIp: clientIp,
-          stationName: stationName,
-          connectedAt: DateTime.now(),
-        );
-        debugPrint('[LanDatabaseServer] New client: $stationName ($clientIp)');
-        _notifyClients();
-      }
-
-      _writeJson(request, {'ok': true, 'serverTime': DateTime.now().toIso8601String()});
-    } catch (e) {
-      debugPrint('[LanDatabaseServer] /api/heartbeat error: $e');
-      request.response.statusCode = HttpStatus.internalServerError;
-      _writeJson(request, {'ok': false});
-    }
-  }
-
-  Future<void> _handleCatalog(HttpRequest request) async {
-    try {
-      final users = await _db.select(_db.users).get();
-      final categories = await _db.select(_db.categories).get();
-      final brands = await _db.select(_db.brands).get();
-      final products = await _db.select(_db.products).get();
-      final settings = await _db.select(_db.settings).get();
-      final movements = await _db.select(_db.stockMovements).get();
-      final sales = await (_db.select(_db.sales)
-            ..orderBy([(s) => OrderingTerm.desc(s.createdAt)])
-            ..limit(250))
-          .get();
-      final saleIds = sales.map((s) => s.id).toSet();
-      final saleItems = saleIds.isEmpty
-          ? <SaleItem>[]
-          : await (_db.select(_db.saleItems)..where((i) => i.saleId.isIn(saleIds))).get();
-      final payments = saleIds.isEmpty
-          ? <Payment>[]
-          : await (_db.select(_db.payments)..where((p) => p.saleId.isIn(saleIds))).get();
-
-      _writeJson(request, {
-        'users': [
-          for (final u in users)
-            {
-              'id': u.id,
-              'username': u.username,
-              'displayName': u.displayName,
-              'passwordHash': u.passwordHash,
-              'role': u.role,
-              'isActive': u.isActive,
-              'createdAt': u.createdAt.toIso8601String(),
-            },
-        ],
-        'categories': [
-          for (final c in categories)
-            {
-              'id': c.id,
-              'name': c.name,
-              'description': c.description,
-              'createdAt': c.createdAt.toIso8601String(),
-              'updatedAt': c.updatedAt.toIso8601String(),
-            },
-        ],
-        'brands': [
-          for (final b in brands)
-            {
-              'id': b.id,
-              'name': b.name,
-              'description': b.description,
-              'createdAt': b.createdAt.toIso8601String(),
-              'updatedAt': b.updatedAt.toIso8601String(),
-            },
-        ],
-        'products': [
-          for (final p in products)
-            {
-              'id': p.id,
-              'sku': p.sku,
-              'barcode': p.barcode,
-              'name': p.name,
-              'categoryId': p.categoryId,
-              'brandId': p.brandId,
-              'description': p.description,
-              'costPrice': p.costPrice,
-              'sellingPrice': p.sellingPrice,
-              'taxRate': p.taxRate,
-              'reorderLevel': p.reorderLevel,
-              'trackingType': p.trackingType.name,
-              'isActive': p.isActive,
-              'createdAt': p.createdAt.toIso8601String(),
-              'updatedAt': p.updatedAt.toIso8601String(),
-            },
-        ],
-        'settings': [
-          for (final s in settings)
-            {
-              'key': s.key,
-              'value': s.value,
-              'updatedAt': s.updatedAt.toIso8601String(),
-            },
-        ],
-        'stockMovements': [
-          for (final m in movements)
-            {
-              'id': m.id,
-              'productId': m.productId,
-              'movementType': m.movementType.name,
-              'quantity': m.quantity,
-              'referenceType': m.referenceType,
-              'referenceId': m.referenceId,
-              'userId': m.userId,
-              'reason': m.reason,
-              'createdAt': m.createdAt.toIso8601String(),
-            },
-        ],
-        'sales': [
-          for (final s in sales)
-            {
-              'id': s.id,
-              'receiptNumber': s.receiptNumber,
-              'customerId': s.customerId,
-              'cashierId': s.cashierId,
-              'subtotal': s.subtotal,
-              'discount': s.discount,
-              'tax': s.tax,
-              'total': s.total,
-              'paymentStatus': s.paymentStatus,
-              'saleStatus': s.saleStatus,
-              'createdAt': s.createdAt.toIso8601String(),
-              'updatedAt': s.updatedAt.toIso8601String(),
-            },
-        ],
-        'saleItems': [
-          for (final i in saleItems)
-            {
-              'id': i.id,
-              'saleId': i.saleId,
-              'productId': i.productId,
-              'quantity': i.quantity,
-              'unitPrice': i.unitPrice,
-              'discount': i.discount,
-              'tax': i.tax,
-              'subtotal': i.subtotal,
-              'serialNumberId': i.serialNumberId,
-            },
-        ],
-        'payments': [
-          for (final p in payments)
-            {
-              'id': p.id,
-              'saleId': p.saleId,
-              'paymentMethod': p.paymentMethod.name,
-              'amount': p.amount,
-              'reference': p.reference,
-              'createdAt': p.createdAt.toIso8601String(),
-            },
-        ],
-      });
-    } catch (e) {
-      debugPrint('[LanDatabaseServer] /api/catalog error: $e');
-      request.response.statusCode = HttpStatus.internalServerError;
-      _writeJson(request, {'error': e.toString()});
-    }
-  }
-
-  Future<void> _handleSalesUpload(HttpRequest request) async {
-    try {
-      final body = await utf8.decoder.bind(request).join();
-      final json = jsonDecode(body) as Map<String, dynamic>;
-      final salesList = json['sales'] as List<dynamic>? ?? [];
-      int synced = 0;
-
-      for (final saleJson in salesList) {
-        final sale = saleJson as Map<String, dynamic>;
-        final saleId = sale['id'] as String;
-        final items = (sale['items'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-        final payments = (sale['payments'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-
-        try {
-          await _db.transaction(() async {
-            final now = DateTime.now();
-            final createdAt = sale['createdAt'] != null
-                ? DateTime.parse(sale['createdAt'] as String)
-                : now;
-            final updatedAt = sale['updatedAt'] != null
-                ? DateTime.parse(sale['updatedAt'] as String)
-                : now;
-
-            final existingSale = await (_db.select(_db.sales)
-                  ..where((s) => s.id.equals(saleId)))
-                .getSingleOrNull();
-
-            if (existingSale != null) {
-              await (_db.update(_db.sales)..where((s) => s.id.equals(saleId)))
-                  .write(
-                SalesCompanion(
-                  receiptNumber: Value(sale['receiptNumber'] as String),
-                  customerId: Value(sale['customerId'] as String?),
-                  cashierId: Value(sale['cashierId'] as String?),
-                  subtotal: Value((sale['subtotal'] as num).toDouble()),
-                  discount: Value((sale['discount'] as num? ?? 0).toDouble()),
-                  tax: Value((sale['tax'] as num? ?? 0).toDouble()),
-                  total: Value((sale['total'] as num).toDouble()),
-                  paymentStatus: Value(sale['paymentStatus'] as String? ?? 'PAID'),
-                  saleStatus: Value(sale['saleStatus'] as String? ?? 'COMPLETED'),
-                  isSynced: const Value(true),
-                  updatedAt: Value(updatedAt),
-                ),
-              );
-            } else {
-              await _db.into(_db.sales).insert(
-                SalesCompanion(
-                  id: Value(saleId),
-                  receiptNumber: Value(sale['receiptNumber'] as String),
-                  customerId: Value(sale['customerId'] as String?),
-                  cashierId: Value(sale['cashierId'] as String?),
-                  subtotal: Value((sale['subtotal'] as num).toDouble()),
-                  discount: Value((sale['discount'] as num? ?? 0).toDouble()),
-                  tax: Value((sale['tax'] as num? ?? 0).toDouble()),
-                  total: Value((sale['total'] as num).toDouble()),
-                  paymentStatus: Value(sale['paymentStatus'] as String? ?? 'PAID'),
-                  saleStatus: Value(sale['saleStatus'] as String? ?? 'COMPLETED'),
-                  isSynced: const Value(true),
-                  createdAt: Value(createdAt),
-                  updatedAt: Value(updatedAt),
-                ),
-              );
-            }
-
-            for (final item in items) {
-              final itemId = item['id'] as String;
-              final qty = (item['quantity'] as num).toDouble();
-              final unitPrice = (item['unitPrice'] as num).toDouble();
-              final discount = (item['discount'] as num? ?? 0).toDouble();
-              final tax = (item['tax'] as num? ?? 0).toDouble();
-              final subtotal = (item['subtotal'] as num? ?? (qty * unitPrice)).toDouble();
-
-              final existingItem = await (_db.select(_db.saleItems)
-                    ..where((i) => i.id.equals(itemId)))
-                  .getSingleOrNull();
-
-              if (existingItem != null) {
-                await (_db.update(_db.saleItems)..where((i) => i.id.equals(itemId)))
-                    .write(
-                  SaleItemsCompanion(
-                    quantity: Value(qty),
-                    unitPrice: Value(unitPrice),
-                    discount: Value(discount),
-                    tax: Value(tax),
-                    subtotal: Value(subtotal),
-                    serialNumberId: Value(item['serialNumberId'] as String?),
-                  ),
-                );
-              } else {
-                await _db.into(_db.saleItems).insert(
-                  SaleItemsCompanion(
-                    id: Value(itemId),
-                    saleId: Value(saleId),
-                    productId: Value(item['productId'] as String),
-                    quantity: Value(qty),
-                    unitPrice: Value(unitPrice),
-                    discount: Value(discount),
-                    tax: Value(tax),
-                    subtotal: Value(subtotal),
-                    serialNumberId: Value(item['serialNumberId'] as String?),
-                  ),
-                );
-              }
-
-              final existingMovement = await (_db.select(_db.stockMovements)
-                    ..where((m) =>
-                        m.referenceId.equals(saleId) &
-                        m.productId.equals(item['productId'] as String)))
-                  .getSingleOrNull();
-
-              if (existingMovement == null) {
-                await _db.into(_db.stockMovements).insert(
-                  StockMovementsCompanion(
-                    id: Value('sync-$saleId-$itemId'),
-                    productId: Value(item['productId'] as String),
-                    movementType: const Value(MovementType.sale),
-                    quantity: Value(-qty),
-                    referenceType: const Value<String?>('sale'),
-                    referenceId: Value<String?>(saleId),
-                    userId: Value<String?>(sale['cashierId'] as String?),
-                    reason: const Value<String?>('LAN station sync'),
-                    createdAt: Value(createdAt),
-                  ),
-                );
-              }
-            }
-
-            for (final payment in payments) {
-              final paymentId = payment['id'] as String;
-              PaymentMethod method = PaymentMethod.cash;
-              final mStr = payment['paymentMethod'] as String? ?? payment['method'] as String? ?? 'cash';
-              try {
-                method = PaymentMethod.values.byName(mStr);
-              } catch (_) {
-                method = PaymentMethod.cash;
-              }
-
-              final existingPayment = await (_db.select(_db.payments)
-                    ..where((p) => p.id.equals(paymentId)))
-                  .getSingleOrNull();
-
-              if (existingPayment != null) {
-                await (_db.update(_db.payments)..where((p) => p.id.equals(paymentId)))
-                    .write(
-                  PaymentsCompanion(
-                    paymentMethod: Value(method),
-                    amount: Value((payment['amount'] as num).toDouble()),
-                    reference: Value(payment['reference'] as String?),
-                  ),
-                );
-              } else {
-                await _db.into(_db.payments).insert(
-                  PaymentsCompanion(
-                    id: Value(paymentId),
-                    saleId: Value(saleId),
-                    paymentMethod: Value(method),
-                    amount: Value((payment['amount'] as num).toDouble()),
-                    reference: Value(payment['reference'] as String?),
-                    createdAt: Value(payment['createdAt'] != null
-                        ? DateTime.parse(payment['createdAt'] as String)
-                        : createdAt),
-                  ),
-                );
-              }
-            }
-          });
-          synced++;
-        } catch (e) {
-          debugPrint('[LanDatabaseServer] Failed to save sale $saleId: $e');
-        }
-      }
-
-      // Notify host UI that new data arrived
-      _db.markTablesUpdated({_db.sales, _db.saleItems, _db.payments, _db.stockMovements});
-
-      _writeJson(request, {'ok': true, 'synced': synced});
-    } catch (e) {
-      debugPrint('[LanDatabaseServer] /api/sales error: $e');
-      request.response.statusCode = HttpStatus.internalServerError;
-      _writeJson(request, {'ok': false, 'error': e.toString()});
-    }
-  }
-
-  Future<void> _handleClientPush(HttpRequest request) async {
-    try {
-      final body = await utf8.decoder.bind(request).join();
-      final json = jsonDecode(body) as Map<String, dynamic>;
-
-      await _db.transaction(() async {
-        // Categories
-        for (final c in (json['categories'] as List<dynamic>? ?? [])) {
-          final map = c as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final name = map['name'] as String;
-          final existing = await (_db.select(_db.categories)
-                ..where((cat) => cat.id.equals(id) | cat.name.equals(name)))
-              .getSingleOrNull();
-          if (existing != null) {
-            await (_db.update(_db.categories)..where((cat) => cat.id.equals(existing.id)))
-                .write(CategoriesCompanion(
-              id: Value(id),
-              name: Value(name),
-              description: Value(map['description'] as String?),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          } else {
-            await _db.into(_db.categories).insert(CategoriesCompanion.insert(
-              id: id,
-              name: name,
-              description: Value(map['description'] as String?),
-              createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          }
-        }
-
-        // Brands
-        for (final b in (json['brands'] as List<dynamic>? ?? [])) {
-          final map = b as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final name = map['name'] as String;
-          final existing = await (_db.select(_db.brands)
-                ..where((brd) => brd.id.equals(id) | brd.name.equals(name)))
-              .getSingleOrNull();
-          if (existing != null) {
-            await (_db.update(_db.brands)..where((brd) => brd.id.equals(existing.id)))
-                .write(BrandsCompanion(
-              id: Value(id),
-              name: Value(name),
-              description: Value(map['description'] as String?),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          } else {
-            await _db.into(_db.brands).insert(BrandsCompanion.insert(
-              id: id,
-              name: name,
-              description: Value(map['description'] as String?),
-              createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          }
-        }
-
-        // Products
-        for (final p in (json['products'] as List<dynamic>? ?? [])) {
-          final map = p as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final sku = map['sku'] as String;
-          ProductTrackingType trackingType = ProductTrackingType.quantity;
-          if (map['trackingType'] == 'serialized') {
-            trackingType = ProductTrackingType.serialized;
-          }
-          final existing = await (_db.select(_db.products)
-                ..where((prd) => prd.id.equals(id) | prd.sku.equals(sku)))
-              .getSingleOrNull();
-          if (existing != null) {
-            await (_db.update(_db.products)..where((prd) => prd.id.equals(existing.id)))
-                .write(ProductsCompanion(
-              id: Value(id),
-              sku: Value(sku),
-              barcode: Value(map['barcode'] as String?),
-              name: Value(map['name'] as String),
-              categoryId: Value(map['categoryId'] as String?),
-              brandId: Value(map['brandId'] as String?),
-              description: Value(map['description'] as String?),
-              costPrice: Value((map['costPrice'] as num).toDouble()),
-              sellingPrice: Value((map['sellingPrice'] as num).toDouble()),
-              taxRate: Value((map['taxRate'] as num? ?? 0).toDouble()),
-              reorderLevel: Value((map['reorderLevel'] as num? ?? 0).toDouble()),
-              trackingType: Value(trackingType),
-              isActive: Value(map['isActive'] as bool? ?? true),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          } else {
-            await _db.into(_db.products).insert(ProductsCompanion.insert(
-              id: id,
-              sku: sku,
-              barcode: Value(map['barcode'] as String?),
-              name: map['name'] as String,
-              categoryId: Value(map['categoryId'] as String?),
-              brandId: Value(map['brandId'] as String?),
-              description: Value(map['description'] as String?),
-              costPrice: (map['costPrice'] as num).toDouble(),
-              sellingPrice: (map['sellingPrice'] as num).toDouble(),
-              taxRate: Value((map['taxRate'] as num? ?? 0).toDouble()),
-              reorderLevel: Value((map['reorderLevel'] as num? ?? 0).toDouble()),
-              trackingType: Value(trackingType),
-              isActive: Value(map['isActive'] as bool? ?? true),
-              createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-              updatedAt: Value(DateTime.parse(map['updatedAt'] as String)),
-            ));
-          }
-        }
-
-        // StockMovements from Client
-        for (final m in (json['stockMovements'] as List<dynamic>? ?? [])) {
-          final map = m as Map<String, dynamic>;
-          final id = map['id'] as String;
-          final existing = await (_db.select(_db.stockMovements)
-                ..where((mov) => mov.id.equals(id)))
-              .getSingleOrNull();
-          if (existing == null) {
-            MovementType type = MovementType.adjustment;
-            try {
-              type = MovementType.values.byName(map['movementType'] as String);
-            } catch (_) {}
-            await _db.into(_db.stockMovements).insert(StockMovementsCompanion(
-              id: Value(id),
-              productId: Value(map['productId'] as String),
-              movementType: Value(type),
-              quantity: Value((map['quantity'] as num).toDouble()),
-              referenceType: Value(map['referenceType'] as String?),
-              referenceId: Value(map['referenceId'] as String?),
-              userId: Value(map['userId'] as String?),
-              reason: Value(map['reason'] as String?),
-              createdAt: Value(DateTime.parse(map['createdAt'] as String)),
-            ));
-          }
-        }
-      });
-
-      _db.markTablesUpdated({
-        _db.products,
-        _db.categories,
-        _db.brands,
-        _db.stockMovements,
-      });
-
-      _writeJson(request, {'ok': true});
-    } catch (e) {
-      debugPrint('[LanDatabaseServer] /api/sync/push error: $e');
-      request.response.statusCode = HttpStatus.internalServerError;
-      _writeJson(request, {'ok': false, 'error': e.toString()});
     }
   }
 

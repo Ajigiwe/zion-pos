@@ -63,6 +63,7 @@ class AppDatabase extends _$AppDatabase {
     onCreate: (m) async {
       await m.createAll();
       await createSyncMetaTables(m.database);
+      await createSyncIndexes(m.database);
       await createSyncTriggers(m.database);
       await _seed();
     },
@@ -129,7 +130,21 @@ class AppDatabase extends _$AppDatabase {
         await m.addColumn(importBatches, importBatches.rev);
         await m.addColumn(importBatches, importBatches.dirty);
         await m.createTable(syncQueue);
+        // Rows written before sync existed are unproven replicas: pushing them
+        // wholesale would fight the host over every username and category.
+        // Let the pull establish the host's truth instead; anything edited
+        // from now on is marked dirty by the triggers. The one exception is
+        // sales the old protocol never delivered.
+        for (final spec in syncTables) {
+          await m.database.customStatement(
+            'UPDATE "${spec.table}" SET dirty = 0 WHERE dirty = 1',
+          );
+        }
+        await m.database.customStatement(
+          'UPDATE sales SET dirty = 1 WHERE is_synced = 0 AND dirty = 0',
+        );
         await createSyncMetaTables(m.database);
+        await createSyncIndexes(m.database);
         await createSyncTriggers(m.database);
         await _repairDuplicatedSaleMovements(m.database);
       }
@@ -154,10 +169,10 @@ class AppDatabase extends _$AppDatabase {
   Future<void> _repairDuplicatedSaleMovements(DatabaseConnectionUser db) async {
     await db.customStatement(
       "DELETE FROM stock_movements "
-      "WHERE id LIKE 'sync-%' AND referenceType = 'sale' AND EXISTS ("
+      "WHERE id LIKE 'sync-%' AND reference_type = 'sale' AND EXISTS ("
       '  SELECT 1 FROM stock_movements other'
-      '  WHERE other.referenceId = stock_movements.referenceId'
-      '    AND other.productId = stock_movements.productId'
+      '  WHERE other.reference_id = stock_movements.reference_id'
+      '    AND other.product_id = stock_movements.product_id'
       '    AND other.id <> stock_movements.id'
       ')',
     );
@@ -174,6 +189,10 @@ class AppDatabase extends _$AppDatabase {
             name: name,
             createdAt: Value(now),
             updatedAt: Value(now),
+            // Seeded rows are placeholders, not work: a client must not ship
+            // its factory categories to the host. The pull replaces them with
+            // the host's own set.
+            dirty: const Value(false),
           ),
         );
       }
@@ -201,6 +220,7 @@ class AppDatabase extends _$AppDatabase {
               key: key,
               value: value,
               updatedAt: Value(now),
+              dirty: const Value(false),
             ),
           );
         }
@@ -219,6 +239,8 @@ class AppDatabase extends _$AppDatabase {
         displayName: 'Owner',
         passwordHash: hashPassword(kDefaultOwnerPassword),
         role: 'OWNER',
+        // Like every other seeded row: a placeholder until the host proves it.
+        dirty: const Value(false),
       ),
     );
   }

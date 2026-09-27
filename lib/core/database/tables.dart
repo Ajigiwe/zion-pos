@@ -7,13 +7,16 @@ import 'package:drift/drift.dart';
 /// edits a row it last saw at `rev = N`, and the host only accepts that change
 /// while the row is still at `N`.
 ///
-/// `dirty` marks rows with local changes not yet accepted by the host station.
-/// It is set by database triggers (see `sync_schema.dart`), never by hand.
+/// `dirty` marks rows with local changes not yet accepted by the host
+/// station. It defaults to `true` — a fresh row is unproven until the host
+/// acknowledges it — and is cleared by the sync service on acknowledgement.
+/// It is set/cleared by database triggers (see `sync_schema.dart`), never by
+/// hand at individual call sites.
 // Every table declares these two columns explicitly: the drift generator only
 // picks up columns declared on the table class itself.
 //
 //   IntColumn get rev => integer().withDefault(const Constant(1))();
-//   BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+//   BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 
 /// Users of the POS, mirroring the design doc's `users` entity.
 /// `role` is one of OWNER, ADMIN, MANAGER, CASHIER, INVENTORY_MANAGER.
@@ -26,7 +29,7 @@ class Users extends Table {
   BoolColumn get isActive => boolean().withDefault(const Constant(true))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 class Categories extends Table {
@@ -36,7 +39,7 @@ class Categories extends Table {
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 class Brands extends Table {
@@ -46,7 +49,7 @@ class Brands extends Table {
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 class Suppliers extends Table {
@@ -58,7 +61,7 @@ class Suppliers extends Table {
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// Whether a product is counted by quantity only, or tracked by serial number.
@@ -87,7 +90,7 @@ class Products extends Table {
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// How a customer paid, per design doc §12. A sale may have several payment
@@ -120,7 +123,7 @@ class Sales extends Table {
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// A single product line on a sale (§11). unitPrice snapshots the price at
@@ -138,7 +141,7 @@ class SaleItems extends Table {
   /// Populated for serialized products once serial tracking is implemented.
   TextColumn get serialNumberId => text().nullable()();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// One payment record on a sale (§12). A cash + mobile money split is two
@@ -151,7 +154,7 @@ class Payments extends Table {
   TextColumn get reference => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// Money returned to a customer against an original sale (§14). The original
@@ -166,7 +169,7 @@ class Refunds extends Table {
   TextColumn get reason => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// Which original sale lines were returned and how much of each (§14).
@@ -179,7 +182,7 @@ class RefundItems extends Table {
   RealColumn get unitPrice => real()();
   RealColumn get subtotal => real()();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// An exchange links the return of goods from an original sale to a
@@ -199,7 +202,7 @@ class Exchanges extends Table {
   RealColumn get difference => real()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// Generic local key/value settings. The store profile (printed on receipts)
@@ -211,7 +214,7 @@ class Settings extends Table {
   TextColumn get value => text()();
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 
   @override
   Set<Column> get primaryKey => {key};
@@ -231,7 +234,7 @@ class AuditLogs extends Table {
   TextColumn get deviceId => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// All stock movements recorded in the ledger, per design doc §13.
@@ -269,7 +272,7 @@ class ImportBatches extends Table {
   TextColumn get status => text().withDefault(const Constant('COMPLETED'))();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 class StockMovements extends Table {
@@ -285,7 +288,7 @@ class StockMovements extends Table {
   TextColumn get reason => text().nullable()();
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
   IntColumn get rev => integer().withDefault(const Constant(1))();
-  BoolColumn get dirty => boolean().withDefault(const Constant(false))();
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
 }
 
 /// Pending outbound sync operations (design doc §24 `sync_queue`).

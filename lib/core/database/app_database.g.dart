@@ -108,7 +108,7 @@ class $UsersTable extends Users with TableInfo<$UsersTable, User> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -646,7 +646,7 @@ class $CategoriesTable extends Categories
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -1098,7 +1098,7 @@ class $BrandsTable extends Brands with TableInfo<$BrandsTable, Brand> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -1568,7 +1568,7 @@ class $SuppliersTable extends Suppliers
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -2217,7 +2217,7 @@ class $ProductsTable extends Products with TableInfo<$ProductsTable, Product> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -3108,7 +3108,7 @@ class $StockMovementsTable extends StockMovements
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -3835,7 +3835,7 @@ class $SalesTable extends Sales with TableInfo<$SalesTable, Sale> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -4639,7 +4639,7 @@ class $SaleItemsTable extends SaleItems
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -5258,7 +5258,7 @@ class $PaymentsTable extends Payments with TableInfo<$PaymentsTable, Payment> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -5794,7 +5794,7 @@ class $RefundsTable extends Refunds with TableInfo<$RefundsTable, Refund> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -6415,7 +6415,7 @@ class $RefundItemsTable extends RefundItems
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -7009,7 +7009,7 @@ class $ExchangesTable extends Exchanges
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -7673,7 +7673,7 @@ class $AuditLogsTable extends AuditLogs
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -8314,7 +8314,7 @@ class $ImportBatchesTable extends ImportBatches
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [
@@ -8980,7 +8980,7 @@ class $SettingsTable extends Settings with TableInfo<$SettingsTable, Setting> {
     defaultConstraints: GeneratedColumn.constraintIsAlways(
       'CHECK ("dirty" IN (0, 1))',
     ),
-    defaultValue: const Constant(false),
+    defaultValue: const Constant(true),
   );
   @override
   List<GeneratedColumn> get $columns => [key, value, updatedAt, rev, dirty];

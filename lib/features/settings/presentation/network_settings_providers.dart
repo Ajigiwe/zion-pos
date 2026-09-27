@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:instrument_pos/core/database/database_provider.dart';
 import 'package:instrument_pos/core/database/lan_database_server.dart';
+import 'package:instrument_pos/core/database/lan_sync_service.dart';
 import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/features/settings/domain/network_settings.dart';
 
@@ -57,6 +58,10 @@ class NetworkSettingsController extends Notifier<NetworkSettings> {
   }
 
   Future<void> _syncServerWithMode(NetworkSettings settings) async {
+    // The sync triggers read the station role to decide whether local edits
+    // advance the change sequence; keep them in step with the UI mode.
+    await ref.read(databaseProvider).updateSyncRole(settings.mode.name);
+
     final server = ref.read(lanDatabaseServerProvider);
     if (settings.isHost) {
       if (!server.isRunning) {
@@ -67,11 +72,10 @@ class NetworkSettingsController extends Notifier<NetworkSettings> {
           );
         } catch (_) {}
       }
-    } else {
-      if (server.isRunning) {
-        await server.stop();
-      }
+    } else if (server.isRunning) {
+      await server.stop();
     }
+    await ref.read(lanSyncServiceProvider).restart();
   }
 
   Future<void> setMode(
@@ -104,11 +108,9 @@ class NetworkSettingsController extends Notifier<NetworkSettings> {
       hostPort: port,
       securityPin: securityPin,
     ));
-    if (updated.isHost) {
-      final server = ref.read(lanDatabaseServerProvider);
-      await server.stop();
-      await server.start(port: port, securityPin: securityPin);
-    }
+    final server = ref.read(lanDatabaseServerProvider);
+    await server.stop();
+    await _syncServerWithMode(updated);
   }
 
   Future<void> updateClientConfig({
@@ -130,6 +132,7 @@ class NetworkSettingsController extends Notifier<NetworkSettings> {
       hostPort: port,
       securityPin: securityPin,
     ));
+    await _syncServerWithMode(updated);
   }
 }
 

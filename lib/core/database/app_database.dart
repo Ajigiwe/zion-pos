@@ -1,5 +1,13 @@
+// The createStream override below needs drift's internal QueryStreamFetcher
+// type, which is not re-exported by package:drift/drift.dart.
+// ignore_for_file: implementation_imports, invalid_use_of_internal_member
+
+import 'dart:async';
+
 import 'package:drift/drift.dart';
 import 'package:drift_flutter/drift_flutter.dart';
+import 'package:drift/src/runtime/executor/stream_queries.dart'
+    show QueryStreamFetcher;
 import 'package:instrument_pos/core/database/sync_schema.dart';
 import 'package:instrument_pos/core/database/tables.dart';
 import 'package:instrument_pos/core/database/workstation_config.dart';
@@ -33,6 +41,18 @@ class AppDatabase extends _$AppDatabase {
   /// Uses the platform file database by default; tests inject an executor.
   AppDatabase([QueryExecutor? executor])
     : super(executor ?? driftDatabase(name: 'instrument_pos'));
+
+  /// Shields every `watch()` stream from downstream pauses.
+  ///
+  /// Riverpod pauses the subscription of a consumer whose TickerMode is off
+  /// (an inactive route or page). Drift's own `close()` waits for every
+  /// watch() listener to acknowledge its close event, which a paused listener
+  /// never does — so `db.close()` would hang forever and restoring a backup
+  /// would freeze behind the file dialog. The relay below keeps the
+  /// drift-side subscription running while downstream events simply buffer.
+  @override
+  Stream<T> createStream<T extends Object>(QueryStreamFetcher<T> stmt) =>
+      _pauseImmune(super.createStream(stmt));
 
   /// Default categories from the design doc §9, seeded once on first run.
   static const _defaultCategories = [
@@ -246,4 +266,52 @@ class AppDatabase extends _$AppDatabase {
   }
 
   static String _uuid() => const Uuid().v4();
+}
+
+/// Relays [source] to each listener without ever pausing the upstream
+/// subscription: downstream pauses are absorbed here, so drift's listener
+/// stays active and closable (see [AppDatabase.createStream]).
+///
+/// While paused, only the newest event is kept — every `watch()` event is a
+/// full result set, so holding one is as accurate as holding them all and
+/// keeps the buffer at O(1) even when a page sits offstage during a long sync.
+Stream<T> _pauseImmune<T extends Object>(Stream<T> source) {
+  return Stream<T>.multi((listener) {
+    var paused = false;
+    T? newestWhilePaused;
+    StreamSubscription<T>? subscription;
+
+    void deliverPending() {
+      final pending = newestWhilePaused;
+      newestWhilePaused = null;
+      if (pending != null) {
+        listener.addSync(pending);
+      }
+    }
+
+    listener
+      ..onPause = () {
+        paused = true;
+      }
+      ..onResume = () {
+        paused = false;
+        deliverPending();
+      }
+      ..onCancel = () => subscription?.cancel();
+
+    subscription = source.listen(
+      (event) {
+        if (paused) {
+          newestWhilePaused = event;
+        } else {
+          listener.addSync(event);
+        }
+      },
+      onError: listener.addErrorSync,
+      onDone: () {
+        deliverPending();
+        listener.closeSync();
+      },
+    );
+  });
 }

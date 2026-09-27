@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/drift.dart';
@@ -188,7 +189,16 @@ Future<void> restoreDatabaseFromBackup({
   }
 
   // Swap the files.
-  await db.close();
+  try {
+    await db.close().timeout(const Duration(seconds: 5));
+  } on TimeoutException {
+    // Belt and braces for the pause-hang: a watch() listener created outside
+    // AppDatabase.createStream (e.g. inside a transaction) can still block
+    // drift's close() forever. Shut the executor down directly instead — it
+    // releases the file without waiting for stream listeners (a second
+    // close() later is a no-op in drift).
+    await db.executor.close();
+  }
   for (final suffix in ['-wal', '-shm']) {
     final sidecar = File('$currentPath$suffix');
     if (await sidecar.exists()) {

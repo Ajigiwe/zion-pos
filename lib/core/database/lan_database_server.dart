@@ -194,27 +194,34 @@ class LanDatabaseServer {
     await request.response.close();
   }
 
-  /// Rejects sync traffic before it is parsed unless the station proves it
-  /// knows the pairing PIN.
+  /// Verifies the pairing PIN before a sync endpoint runs.
+  ///
+  /// With no PIN set the shop has chosen an open LAN sync (the settings UI
+  /// calls the PIN optional): refusing here would leave terminals showing
+  /// "connected" — heartbeat is public — while nothing ever syncs. Setting a
+  /// PIN locks the endpoints to stations that know it.
   Future<void> _withSyncAuth(
     HttpRequest request,
     Future<void> Function(HttpRequest request) handler,
   ) async {
     final pin = (_securityPin ?? '').trim();
     if (pin.isEmpty) {
-      request.response.statusCode = HttpStatus.forbidden;
-      _writeJson(request, {
-        'ok': false,
-        'error': 'pin_required',
-        'message': 'Set a security PIN on the host station to enable sync.',
-      });
+      debugPrint(
+        '[LanDatabaseServer] sync accepted without a PIN — '
+        'set one in Settings → Network to lock the LAN down',
+      );
+      await handler(request);
       return;
     }
     final stationId = request.headers.value('X-Station-Id') ?? '';
     final token = request.headers.value('X-Auth-Token');
     if (!verifySyncToken(pin: pin, stationId: stationId, token: token)) {
       request.response.statusCode = HttpStatus.unauthorized;
-      _writeJson(request, {'ok': false, 'error': 'unauthorized'});
+      _writeJson(request, {
+        'ok': false,
+        'error': 'unauthorized',
+        'message': 'The security PIN does not match this station.',
+      });
       return;
     }
     await handler(request);

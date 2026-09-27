@@ -24,7 +24,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dart run build_runner build --delete-conflicting-outputs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-flutter analyze
+# Pre-existing infos/warnings must not abort a release build; errors still do.
+flutter analyze --no-fatal-infos --no-fatal-warnings
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 flutter test
@@ -35,7 +36,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $iscc = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $iscc) {

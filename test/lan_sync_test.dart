@@ -9,6 +9,7 @@ import 'package:instrument_pos/core/database/lan_sync_service.dart';
 import 'package:instrument_pos/core/database/sync_schema.dart';
 import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/core/numbering/document_numbers.dart';
+import 'package:instrument_pos/features/auth/data/auth_repository.dart';
 
 /// flutter_test swaps in an HttpClient that answers every request with 400.
 /// These tests talk to a real socket on the loopback interface, so opt out by
@@ -120,6 +121,37 @@ void main() {
           total: 10,
         ));
 
+    test('client numbers in the table do not derail the host sequence',
+        () async {
+      await addSale('s1', 'SA-00001');
+      await addSale('s2', 'SA-00002');
+      // A client terminal's receipt, delivered by sync.
+      await addSale('c1', 'SA-K7F2-00001');
+
+      final next = await nextDocumentNumber(
+        db,
+        table: 'sales',
+        column: 'receipt_number',
+        prefix: 'SA',
+      );
+
+      expect(next, 'SA-00003',
+          reason: 'the host must ignore another station\'s numbering segment');
+    });
+
+    test('the returned number is always free to insert', () async {
+      await addSale('s1', 'SA-00001');
+      await addSale('c1', 'SA-K7F2-00001');
+
+      final next = await nextDocumentNumber(
+        db,
+        table: 'sales',
+        column: 'receipt_number',
+        prefix: 'SA',
+      );
+      await addSale('s2', next);
+    });
+
     test('host and standalone stations keep the classic SA-##### shape',
         () async {
       final first = await nextDocumentNumber(
@@ -225,13 +257,24 @@ void main() {
       return LanSyncService(clientDb);
     }
 
-    test('sync refuses to run without a pairing PIN on the host', () async {
+    test('sync runs on a host that has not set a pairing PIN', () async {
+      // The settings UI calls the PIN optional: refusing sync here would leave
+      // terminals "connected" through the public heartbeat while nothing
+      // actually moves.
       await startServer(pin: '');
       final service = await connect(pin: '');
       await service.syncNow();
 
-      expect(service.isOnlineNotifier.value, isFalse);
-      expect(service.statusNotifier.value, contains('PIN'));
+      expect(service.isOnlineNotifier.value, isTrue);
+      expect(service.statusNotifier.value, contains('Synced'));
+    });
+
+    test('a client PIN does not get in the way of an open host', () async {
+      await startServer(pin: '');
+      final service = await connect(pin: '4242');
+      await service.syncNow();
+
+      expect(service.isOnlineNotifier.value, isTrue);
     });
 
     test('sync refuses a token built from the wrong PIN', () async {
@@ -467,6 +510,65 @@ void main() {
           .map((s) => s.receiptNumber)
           .toSet();
       expect(receipts, {'SA-00001', 'SA-K7F2-00001'});
+    });
+
+    test('a synced account logs in while the host is switched off', () async {
+      await startServer(pin: '4242');
+      await DriftAuthRepository(hostDb).createUser(
+        username: 'cashier',
+        displayName: 'Nadia',
+        role: 'CASHIER',
+        password: 'sale123',
+      );
+
+      final service = await connect();
+      await service.syncNow();
+
+      // The host goes home: no heartbeat, no HTTP, nothing to fall back on.
+      await server!.stop();
+
+      final user = await DriftAuthRepository(clientDb)
+          .authenticate('cashier', 'sale123');
+      expect(user.username, 'cashier');
+      expect(user.role, 'CASHIER');
+
+      // Offline verification still checks the hash, not just the username.
+      await expectLater(
+        DriftAuthRepository(clientDb).authenticate('cashier', 'wrong-pass'),
+        throwsA(
+          isA<AuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('Invalid username or password'),
+          ),
+        ),
+      );
+    });
+
+    test('an account that never reached this terminal fails with guidance',
+        () async {
+      await startServer(pin: '4242');
+      await DriftAuthRepository(hostDb).createUser(
+        username: 'neverseen',
+        displayName: 'New Hire',
+        role: 'CASHIER',
+        password: 'sale123',
+      );
+      // Configured as a client, but no sync has run here yet, so the account
+      // exists only on the host — which is now unreachable.
+      await connect();
+      await server!.stop();
+
+      await expectLater(
+        DriftAuthRepository(clientDb).authenticate('neverseen', 'sale123'),
+        throwsA(
+          isA<AuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('Host PC is running'),
+          ),
+        ),
+      );
     });
   });
 }

@@ -4,6 +4,7 @@ import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:instrument_pos/core/app_restart.dart';
 import 'package:instrument_pos/core/database/app_database.dart';
+import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/core/security/passwords.dart';
 import 'package:instrument_pos/features/audit/data/audit_repository.dart';
 import 'package:instrument_pos/features/auth/data/auth_repository.dart';
@@ -166,4 +167,164 @@ void main() {
       throwsA(isA<BackupException>()),
     );
   });
+
+  test(
+    'restore resets the sync cursor so the next pull re-sends host changes',
+    () async {
+      // A client that had already applied host changes up to rev 500...
+      WorkstationConfig.setCurrentForTest(
+        const WorkstationConfig(
+          mode: 'client',
+          stationId: 'station-1',
+          stationCode: 'K7F2',
+          lastRev: 500,
+        ),
+      );
+      addTearDown(
+        () => WorkstationConfig.setCurrentForTest(const WorkstationConfig()),
+      );
+
+      final db = await openLive();
+      final auth = DriftAuthRepository(db);
+      final cashier = await auth.createUser(
+        username: 'ama',
+        displayName: 'Ama',
+        role: 'CASHIER',
+        password: 'secret1',
+      );
+      final service = BackupService(db);
+      await service.exportBackup(
+        destinationPath: backupPath,
+        actingUserId: cashier.id,
+      );
+
+      await restoreDatabaseFromBackup(
+        db: db,
+        currentPath: livePath,
+        sourcePath: backupPath,
+        actingUsername: kDefaultOwnerUsername,
+      );
+
+      // ...restores data from an earlier point. The cursor lives in the
+      // workstation config, not in the backup, so the restore has to rewind
+      // it: otherwise the next delta pull starts at rev 500 and every host
+      // change the backup never received is skipped forever.
+      expect(WorkstationConfig.current.lastRev, 0);
+    },
+  );
+
+  test(
+    'a restored database still syncs: role applied and change triggers armed',
+    () async {
+      WorkstationConfig.setCurrentForTest(
+        const WorkstationConfig(
+          mode: 'client',
+          stationId: 'station-2',
+          stationCode: 'ABCD',
+          lastRev: 500,
+        ),
+      );
+      addTearDown(
+        () => WorkstationConfig.setCurrentForTest(const WorkstationConfig()),
+      );
+
+      final db = await openLive();
+      final auth = DriftAuthRepository(db);
+      final cashier = await auth.createUser(
+        username: 'ama',
+        displayName: 'Ama',
+        role: 'CASHIER',
+        password: 'secret1',
+      );
+      await BackupService(db).exportBackup(
+        destinationPath: backupPath,
+        actingUserId: cashier.id,
+      );
+
+      await restoreDatabaseFromBackup(
+        db: db,
+        currentPath: livePath,
+        sourcePath: backupPath,
+        actingUsername: kDefaultOwnerUsername,
+      );
+
+      final restored = await openLive();
+      addTearDown(restored.close);
+
+      // beforeOpen re-applied this station's role from the config, so the
+      // restored file knows it is a client, not a standalone machine.
+      final role = await restored
+          .customSelect("SELECT value FROM sync_meta WHERE key = 'role'")
+          .getSingle();
+      expect(role.data['value'], 'client');
+
+      // The sync triggers survived the file swap: a local row takes a fresh
+      // change sequence (rev past the column default) and is queued for push.
+      await restored.into(restored.categories).insert(
+            CategoriesCompanion.insert(
+              id: 'c-restored',
+              name: 'Post-restore category',
+            ),
+          );
+      final row = await (restored.select(restored.categories)
+            ..where((c) => c.id.equals('c-restored')))
+          .getSingle();
+      expect(row.dirty, isTrue);
+      expect(row.rev, greaterThan(1));
+    },
+  );
+
+  test(
+    'restore of a manually copied database keeps rows still in its WAL',
+    () async {
+      final db = await openLive();
+      final auth = DriftAuthRepository(db);
+      final cashier = await auth.createUser(
+        username: 'ama',
+        displayName: 'Ama',
+        role: 'CASHIER',
+        password: 'secret1',
+      );
+      await db
+          .into(db.categories)
+          .insert(CategoriesCompanion.insert(id: 'c-old', name: 'Old category'));
+
+      // A user hand-copies a live database file: the main file plus its WAL,
+      // which holds a transaction that was never checkpointed.
+      final manualCopy = '${temp.path}${Platform.pathSeparator}manual_copy.db';
+      await BackupService(db).exportBackup(
+        destinationPath: manualCopy,
+        actingUserId: cashier.id,
+      );
+
+      final src = sqlite.sqlite3.open(manualCopy);
+      src.execute('PRAGMA journal_mode = WAL');
+      src.execute(
+        "INSERT INTO categories (id, name) VALUES ('c-hot', 'Hot category')",
+      );
+      // Hold a second connection open on the backup so closing [src] cannot
+      // checkpoint the WAL into the main file — that is exactly the state a
+      // hand-copied database is in. A connection only counts as a WAL user
+      // once it has actually touched the file, hence the SELECT.
+      final holder = sqlite.sqlite3.open(manualCopy);
+      final holderRows =
+          holder.select('SELECT COUNT(*) AS c FROM categories').first['c'];
+      expect(holderRows, 15); // 13 seeded + Old category + the one in the WAL
+      src.dispose();
+
+      await restoreDatabaseFromBackup(
+        db: db,
+        currentPath: livePath,
+        sourcePath: manualCopy,
+        actingUsername: kDefaultOwnerUsername,
+      );
+      holder.dispose();
+
+      final restored = await openLive();
+      addTearDown(restored.close);
+      final names = (await restored.select(restored.categories).get())
+          .map((c) => c.name);
+      expect(names, containsAll(['Old category', 'Hot category']));
+    },
+  );
 }

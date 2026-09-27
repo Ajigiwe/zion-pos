@@ -4,6 +4,7 @@ import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/features/auth/presentation/session_provider.dart';
 import 'package:instrument_pos/features/settings/presentation/network_settings_card.dart';
 import 'package:instrument_pos/features/settings/presentation/store_settings_providers.dart';
+import 'package:instrument_pos/features/settings/presentation/sync_status_indicator.dart';
 
 class LoginPage extends ConsumerStatefulWidget {
   const LoginPage({super.key});
@@ -184,6 +185,8 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                           ],
                         ),
                       ),
+                      const SizedBox(height: 10),
+                      const SyncStatusIndicator(compact: true),
                       const SizedBox(height: 16),
 
                       TextField(

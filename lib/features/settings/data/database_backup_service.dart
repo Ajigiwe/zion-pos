@@ -4,6 +4,7 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:instrument_pos/core/app_restart.dart';
 import 'package:instrument_pos/core/database/app_database.dart';
+import 'package:instrument_pos/core/database/workstation_config.dart';
 import 'package:instrument_pos/core/security/passwords.dart';
 import 'package:instrument_pos/features/audit/data/audit_repository.dart';
 import 'package:instrument_pos/features/auth/data/auth_repository.dart';
@@ -201,6 +202,13 @@ Future<void> restoreDatabaseFromBackup({
   for (var i = 0; i < 5; i++) {
     try {
       await File(sourcePath).copy(currentPath);
+      // A backup that was made by copying a *live* database (rather than
+      // through Export backup) still has its WAL next to it; without that
+      // file the snapshot silently loses every recent transaction.
+      final sourceWal = File('$sourcePath-wal');
+      if (await sourceWal.exists()) {
+        await sourceWal.copy('$currentPath-wal');
+      }
       copyError = null;
       break;
     } catch (e) {
@@ -211,6 +219,12 @@ Future<void> restoreDatabaseFromBackup({
   if (copyError != null) {
     throw BackupException('Could not replace database file ($copyError).');
   }
+
+  // The restored file rolls this station's data back, but the delta-sync
+  // cursor lives in the workstation config — not in the backup. Leaving it
+  // where it was would make the next pull skip every host change that the
+  // restored backup never received.
+  await WorkstationConfig.saveLastRev(0);
 
   // Append the RESTORE audit entry from a throwaway connection; if this ever
   // fails the app restarts anyway and the login screen reports the issue.

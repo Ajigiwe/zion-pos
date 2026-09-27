@@ -538,6 +538,11 @@ class _SalesPageState extends ConsumerState<SalesPage> {
       _snack(e.message);
     } on PaymentException catch (e) {
       _snack(e.message);
+    } catch (e) {
+      // Anything else (a UNIQUE receipt clash, a database error) must never
+      // fail silently: the cashier would tap "Complete sale" and see nothing.
+      debugPrint('[SalesPage] complete sale failed: $e');
+      _snack('Could not complete the sale: $e');
     } finally {
       if (mounted) setState(() => _saving = false);
     }

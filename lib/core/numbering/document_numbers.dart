@@ -39,20 +39,25 @@ Future<String> nextDocumentNumber(
   }
   final rows = await db
       .customSelect(
-        'SELECT "$column" AS n FROM "$table" '
-        "WHERE \"$column\" LIKE ? "
-        'ORDER BY length("$column") DESC, "$column" DESC LIMIT 1',
+        'SELECT "$column" AS n FROM "$table" WHERE "$column" LIKE ?',
         variables: [Variable.withString('$scoped-%')],
       )
       .get();
 
-  var next = 1;
-  if (rows.isNotEmpty) {
-    final value = rows.first.data['n'] as String?;
-    final match = value == null ? null : RegExp(r'(\d+)$').firstMatch(value);
-    if (match != null) {
-      next = int.parse(match.group(1)!) + 1;
-    }
+  // Only this station's own shape counts. On a host the LIKE also matches
+  // receipts delivered by client terminals (`SA-K7F2-00001`); the longest of
+  // those would otherwise pick the sequence and hand out a number the host
+  // has already issued — a UNIQUE violation that fails the sale.
+  final shape = RegExp('^${RegExp.escape(scoped)}-(\\d+)\$');
+  var highest = 0;
+  for (final row in rows) {
+    final value = row.data['n'] as String?;
+    if (value == null) continue;
+    final match = shape.firstMatch(value);
+    if (match == null) continue;
+    final sequence = int.parse(match.group(1)!);
+    if (sequence > highest) highest = sequence;
   }
+  final next = highest + 1;
   return '$scoped-${next.toString().padLeft(5, '0')}';
 }

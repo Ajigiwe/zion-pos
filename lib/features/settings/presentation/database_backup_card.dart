@@ -160,6 +160,8 @@ class _DatabaseBackupCardState extends ConsumerState<DatabaseBackupCard> {
       _snack('Backup saved.');
     } on BackupException catch (e) {
       _snack(e.message);
+    } catch (e) {
+      _snack('Backup failed: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -221,6 +223,8 @@ class _DatabaseBackupCardState extends ConsumerState<DatabaseBackupCard> {
       // On success the app restarts here; nothing further is shown.
     } on BackupException catch (e) {
       _snack(e.message);
+    } catch (e) {
+      _snack('Restore failed: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -276,6 +280,8 @@ class _DatabaseBackupCardState extends ConsumerState<DatabaseBackupCard> {
       _snack('Backup saved. All data wiped successfully.');
     } on BackupException catch (e) {
       _snack(e.message);
+    } catch (e) {
+      _snack('Wipe failed: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

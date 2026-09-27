@@ -4,9 +4,9 @@ import 'package:crypto/crypto.dart';
 
 /// Default secret used when no pairing PIN is configured.
 ///
-/// The host refuses sync endpoints without a PIN, so this value never grants
-/// real access on its own — it only keeps `/api/heartbeat` style traffic
-/// shaped the same way while the operator sets the PIN up.
+/// With no PIN the host accepts sync without checking a token, so this value
+/// only keeps the request shape identical on both sides while the operator
+/// decides whether to lock the LAN down with a PIN.
 const _defaultSecret = 'instrument-pos-lan-v1';
 
 String _secretFor(String pin) {

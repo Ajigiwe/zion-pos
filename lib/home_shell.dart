@@ -13,6 +13,7 @@ import 'package:instrument_pos/features/refunds/presentation/refunds_page.dart';
 import 'package:instrument_pos/features/sales/presentation/sales_page.dart';
 import 'package:instrument_pos/features/products/presentation/products_page.dart';
 import 'package:instrument_pos/features/reports/presentation/reports_page.dart';
+import 'package:instrument_pos/features/settings/presentation/sync_status_indicator.dart';
 
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
@@ -104,6 +105,10 @@ class _HomeShellState extends State<HomeShell> {
                       ),
                     ),
                     const Divider(height: 1),
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(12, 10, 12, 6),
+                      child: SyncStatusIndicator(),
+                    ),
                     Consumer(
                       builder: (context, ref, _) {
                         final user = ref.watch(currentUserProvider);

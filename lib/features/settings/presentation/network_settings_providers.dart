@@ -64,15 +64,11 @@ class NetworkSettingsController extends Notifier<NetworkSettings> {
 
     final server = ref.read(lanDatabaseServerProvider);
     if (settings.isHost) {
-      if (!server.isRunning) {
-        try {
-          await server.start(
-            port: settings.hostPort,
-            securityPin: settings.securityPin,
-          );
-        } catch (_) {}
-      }
-    } else if (server.isRunning) {
+      await server.startRetrying(
+        port: settings.hostPort,
+        securityPin: settings.securityPin,
+      );
+    } else if (server.isRunning || server.isRetrying) {
       await server.stop();
     }
     await ref.read(lanSyncServiceProvider).restart();

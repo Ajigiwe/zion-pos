@@ -495,6 +495,23 @@ class _NetworkSettingsCardState extends ConsumerState<NetworkSettingsCard> {
               ),
             ],
           ),
+          ValueListenableBuilder<String?>(
+            valueListenable: server.startErrorNotifier,
+            builder: (context, error, _) {
+              if (error == null) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  'Retrying automatically: $error',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFFB91C1C),
+                  ),
+                ),
+              );
+            },
+          ),
           const SizedBox(height: 16),
 
           // IP Addresses for Secondary Terminals

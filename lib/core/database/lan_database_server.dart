@@ -40,11 +40,23 @@ class ConnectedClientSession {
 /// laptop. Presence stays on unauthenticated heartbeats; every endpoint that
 /// touches rows requires a token derived from the pairing PIN.
 class LanDatabaseServer {
-  LanDatabaseServer(this._db);
+  LanDatabaseServer(
+    this._db, {
+    this.startRetryInterval = const Duration(seconds: 3),
+  });
 
   final AppDatabase _db;
+
+  /// How often a failed host bind is retried until it succeeds or [stop] runs.
+  final Duration startRetryInterval;
+
   HttpServer? _server;
   String? _securityPin;
+  Timer? _retryTimer;
+  bool _wantRunning = false;
+  bool _starting = false;
+  int _retryPort = 4242;
+  String? _retryPin;
 
   late final Map<String, TableInfo<Table, DataClass>> _infos =
       syncTableInfos(_db);
@@ -60,7 +72,12 @@ class LanDatabaseServer {
       ValueNotifier<List<ConnectedClientSession>>([]);
   final ValueNotifier<bool> isRunningNotifier = ValueNotifier<bool>(false);
 
+  /// Human-readable reason of the last failed bind while host mode wanted the
+  /// server running; cleared once the server starts or [stop] is called.
+  final ValueNotifier<String?> startErrorNotifier = ValueNotifier<String?>(null);
+
   bool get isRunning => _server != null;
+  bool get isRetrying => _wantRunning && _server == null;
   int get port => _server?.port ?? 4242;
 
   /// Starts the LAN server on the given [port].
@@ -71,6 +88,7 @@ class LanDatabaseServer {
     try {
       _server = await HttpServer.bind(InternetAddress.anyIPv4, port);
       isRunningNotifier.value = true;
+      startErrorNotifier.value = null;
       debugPrint('[LanDatabaseServer] Started on port ${_server!.port}');
 
       _expiryTimer = Timer.periodic(
@@ -87,7 +105,45 @@ class LanDatabaseServer {
     } catch (e) {
       debugPrint('[LanDatabaseServer] Failed to start server: $e');
       isRunningNotifier.value = false;
+      if (_wantRunning) {
+        startErrorNotifier.value = 'Server failed to start on port $port: $e';
+      }
       rethrow;
+    }
+  }
+
+  /// Starts the server and keeps retrying every [startRetryInterval] until the
+  /// bind succeeds or [stop] is called. Bind failures (port occupied by a
+  /// leftover process, etc.) are recorded in [startErrorNotifier] instead of
+  /// being swallowed.
+  Future<void> startRetrying({int port = 4242, String? securityPin}) async {
+    _wantRunning = true;
+    _retryPort = port;
+    _retryPin = securityPin;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    if (_server != null) return;
+    await _attemptStart();
+  }
+
+  Future<void> _attemptStart() async {
+    if (_starting || _server != null || !_wantRunning) return;
+    _starting = true;
+    try {
+      await start(port: _retryPort, securityPin: _retryPin);
+    } catch (_) {
+      // start() already recorded the failure in startErrorNotifier.
+    } finally {
+      _starting = false;
+    }
+    if (!_wantRunning && _server != null) {
+      // stop() ran while the bind was in flight; close the zombie server.
+      await stop();
+    } else if (_server == null && _wantRunning) {
+      _retryTimer = Timer(startRetryInterval, () {
+        _retryTimer = null;
+        unawaited(_attemptStart());
+      });
     }
   }
 
@@ -546,8 +602,12 @@ class LanDatabaseServer {
     }
   }
 
-  /// Stops the server.
+  /// Stops the server and cancels any pending start retry.
   Future<void> stop() async {
+    _wantRunning = false;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    startErrorNotifier.value = null;
     _expiryTimer?.cancel();
     _expiryTimer = null;
     _clients.clear();
